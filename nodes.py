@@ -14,9 +14,11 @@ from hydra import initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 
 try:
+    import sam2.build_sam as sam2_build
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 except Exception as ex:  # pragma: no cover - runtime env specific
+    sam2_build = None
     build_sam2 = None
     SAM2ImagePredictor = None
     _sam2_import_error = ex
@@ -25,6 +27,7 @@ else:
 
 
 SAM2_MODEL_DIR = "sam2"
+OPENSHOT_NODEPACK_VERSION = "v1.0.1-hydra-local-config"
 SAM2_MODELS = {
     "sam2.1_hiera_tiny.safetensors": {
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
@@ -202,6 +205,39 @@ def _parse_points(text):
     return pts
 
 
+def _build_sam2_video_predictor(config_name, checkpoint, torch_device):
+    """Build a SAM2 video predictor across package variants."""
+    if sam2_build is None:
+        raise RuntimeError("sam2.build_sam module unavailable")
+
+    candidate_names = (
+        "build_sam2_video_predictor",
+        "build_video_predictor",
+        "build_sam_video_predictor",
+    )
+    found = []
+    last_error = None
+    for name in candidate_names:
+        fn = getattr(sam2_build, name, None)
+        if not callable(fn):
+            continue
+        found.append(name)
+        for kwargs in (
+            {"device": torch_device},
+            {},
+        ):
+            try:
+                return fn(config_name, checkpoint, **kwargs)
+            except TypeError:
+                continue
+            except Exception as ex:
+                last_error = ex
+                continue
+    raise RuntimeError(
+        "Could not build SAM2 video predictor. Found builders={} last_error={}".format(found, last_error)
+    )
+
+
 class OpenShotDownloadAndLoadSAM2Model:
     @classmethod
     def INPUT_TYPES(cls):
@@ -227,12 +263,20 @@ class OpenShotDownloadAndLoadSAM2Model:
         torch_device, dtype = _to_device_dtype(device, precision)
 
         _init_hydra_for_local_configs()
+        print(
+            "[OpenShot-ComfyUI:{}] Loading SAM2 model='{}' checkpoint='{}' configs={}".format(
+                OPENSHOT_NODEPACK_VERSION, model, checkpoint, config_candidates
+            )
+        )
 
         sam_model = None
         last_error = None
         for config_name in config_candidates:
             try:
-                sam_model = build_sam2(config_name, checkpoint, device=torch_device)
+                if str(segmentor or "video") == "video":
+                    sam_model = _build_sam2_video_predictor(config_name, checkpoint, torch_device)
+                else:
+                    sam_model = build_sam2(config_name, checkpoint, device=torch_device)
                 break
             except Exception as ex:
                 last_error = ex
@@ -382,7 +426,23 @@ class OpenShotSam2VideoSegmentationAddPoints:
             if hasattr(model, "image_size"):
                 size = int(model.image_size)
                 image = common_upscale(image.movedim(-1, 1), size, size, "bilinear", "disabled").movedim(1, -1)
-            state = model.init_state(image.permute(0, 3, 1, 2).contiguous(), h, w, device=device)
+            video_tensor = image.permute(0, 3, 1, 2).contiguous()
+            # Support SAM2 API variants for init_state signature.
+            init_errors = []
+            state = None
+            for call in (
+                lambda: model.init_state(video_tensor, h, w, device=device),
+                lambda: model.init_state(video_tensor, h, w),
+                lambda: model.init_state(video_tensor, device=device),
+                lambda: model.init_state(video_tensor),
+            ):
+                try:
+                    state = call()
+                    break
+                except Exception as ex:
+                    init_errors.append(str(ex))
+            if state is None:
+                raise RuntimeError("Failed SAM2 init_state across signature variants: {}".format(init_errors))
             num_frames = int(b)
         else:
             state = prev_inference_state["inference_state"]
@@ -391,13 +451,32 @@ class OpenShotSam2VideoSegmentationAddPoints:
         autocast_device = mm.get_autocast_device(device)
         autocast_ok = not mm.is_device_mps(device)
         with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-            model.add_new_points(
-                inference_state=state,
-                frame_idx=int(frame_index),
-                obj_id=int(object_index),
-                points=coords,
-                labels=labels,
-            )
+            add_errors = []
+            added = False
+            for call in (
+                lambda: model.add_new_points(
+                    inference_state=state,
+                    frame_idx=int(frame_index),
+                    obj_id=int(object_index),
+                    points=coords,
+                    labels=labels,
+                ),
+                lambda: model.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=int(frame_index),
+                    obj_id=int(object_index),
+                    points=coords,
+                    labels=labels,
+                ),
+            ):
+                try:
+                    call()
+                    added = True
+                    break
+                except Exception as ex:
+                    add_errors.append(str(ex))
+            if not added:
+                raise RuntimeError("Failed SAM2 add points across API variants: {}".format(add_errors))
 
         return (
             sam2_model,
