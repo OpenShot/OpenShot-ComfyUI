@@ -10,6 +10,7 @@ This V1 intentionally stays close to standard ComfyUI primitives and types while
 - `OpenShotSam2Segmentation` (single-image)
 - `OpenShotSam2VideoSegmentationAddPoints`
 - `OpenShotSam2VideoSegmentationChunked` (meta-batch/chunk friendly)
+- `OpenShotGroundingDinoDetect` (text-prompted object detection -> mask + JSON)
 
 ## Why this exists
 
@@ -30,6 +31,7 @@ Please see upstream projects for full original implementations and credits.
 - PyTorch (as used by your Comfy install)
 - `decord` (required by many SAM2 video predictor builds)
 - `sam2` Python package/module available in your Comfy runtime
+- GroundingDINO runtime via Hugging Face Transformers (installed from `requirements.txt`)
 
 Install this node pack into `ComfyUI/custom_nodes/OpenShot-ComfyUI` and restart ComfyUI.
 
@@ -44,6 +46,10 @@ Install this node pack into `ComfyUI/custom_nodes/OpenShot-ComfyUI` and restart 
 `requirements.txt` intentionally does **not** install SAM2 from Git. This avoids repeated large temporary downloads and long install times during routine updates.
 
 Ensure your Comfy environment already has a compatible `sam2` installed.
+
+### GroundingDINO model downloads
+
+`OpenShotGroundingDinoDetect` will download selected model weights from Hugging Face on first use and cache them in your HF cache directory.
 
 ## Models
 

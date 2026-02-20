@@ -31,9 +31,22 @@ except Exception as ex:  # pragma: no cover - runtime env specific
 else:
     _sam2_import_error = None
 
+try:
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+except Exception as ex:  # pragma: no cover - runtime env specific
+    AutoModelForZeroShotObjectDetection = None
+    AutoProcessor = None
+    _groundingdino_import_error = ex
+else:
+    _groundingdino_import_error = None
+
 
 SAM2_MODEL_DIR = "sam2"
 OPENSHOT_NODEPACK_VERSION = "v1.0.4-masked-blur-skip-empty"
+GROUNDING_DINO_MODEL_IDS = (
+    "IDEA-Research/grounding-dino-tiny",
+    "IDEA-Research/grounding-dino-base",
+)
 SAM2_MODELS = {
     "sam2.1_hiera_tiny.safetensors": {
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
@@ -58,6 +71,15 @@ def _require_sam2():
     if build_sam2 is None or SAM2ImagePredictor is None:
         raise RuntimeError(
             "SAM2 imports failed. Ensure `sam2` is available in Comfy runtime. Error: {}".format(_sam2_import_error)
+        )
+
+
+def _require_groundingdino():
+    if AutoModelForZeroShotObjectDetection is None or AutoProcessor is None:
+        raise RuntimeError(
+            "GroundingDINO imports failed. Install requirements and restart ComfyUI. Error: {}".format(
+                _groundingdino_import_error
+            )
         )
 
 
@@ -1002,12 +1024,141 @@ class OpenShotImageBlurMasked:
         return (out.to(mm.intermediate_device()),)
 
 
+class OpenShotGroundingDinoDetect:
+    _model_cache = {}
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return ""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {"default": "person.", "multiline": False}),
+                "model_id": (GROUNDING_DINO_MODEL_IDS,),
+                "box_threshold": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "text_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "device": (("auto", "cpu", "cuda", "mps"),),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "STRING")
+    RETURN_NAMES = ("mask", "detections_json")
+    FUNCTION = "detect"
+    CATEGORY = "OpenShot/GroundingDINO"
+
+    def _resolve_device(self, device_name):
+        device_name = str(device_name or "auto").strip().lower()
+        if device_name == "auto":
+            return mm.get_torch_device()
+        return torch.device(device_name)
+
+    def _cache_key(self, model_id, device):
+        return "{}::{}".format(model_id, str(device))
+
+    def _get_model_and_processor(self, model_id, device):
+        key = self._cache_key(model_id, device)
+        if key in self._model_cache:
+            return self._model_cache[key]
+
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
+        model.to(device)
+        model.eval()
+        self._model_cache[key] = (processor, model)
+        return processor, model
+
+    def _tensor_to_pil(self, img):
+        arr = torch.clamp(img, 0.0, 1.0).mul(255.0).byte().cpu().numpy()
+        return Image.fromarray(arr)
+
+    def _boxes_to_mask(self, boxes, height, width):
+        frame_mask = torch.zeros((height, width), dtype=torch.float32)
+        for box in boxes:
+            x0, y0, x1, y1 = [float(v) for v in box]
+            left = int(max(0, min(width, np.floor(x0))))
+            top = int(max(0, min(height, np.floor(y0))))
+            right = int(max(0, min(width, np.ceil(x1))))
+            bottom = int(max(0, min(height, np.ceil(y1))))
+            if right <= left or bottom <= top:
+                continue
+            frame_mask[top:bottom, left:right] = 1.0
+        return frame_mask
+
+    def detect(self, image, prompt, model_id, box_threshold, text_threshold, device, keep_model_loaded):
+        _require_groundingdino()
+
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            raise ValueError("GroundingDINO prompt must not be empty")
+        if not prompt.endswith("."):
+            prompt = "{}.".format(prompt)
+
+        device = self._resolve_device(device)
+        processor, model = self._get_model_and_processor(model_id, device)
+        model.to(device)
+
+        batch = int(image.shape[0])
+        height = int(image.shape[1])
+        width = int(image.shape[2])
+        all_masks = []
+        all_detections = []
+
+        with torch.inference_mode():
+            for i in range(batch):
+                pil = self._tensor_to_pil(image[i])
+                inputs = processor(images=pil, text=prompt, return_tensors="pt")
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                outputs = model(**inputs)
+                result = processor.post_process_grounded_object_detection(
+                    outputs,
+                    inputs["input_ids"],
+                    box_threshold=float(box_threshold),
+                    text_threshold=float(text_threshold),
+                    target_sizes=[(height, width)],
+                )[0]
+
+                boxes = result.get("boxes")
+                labels = result.get("labels")
+                scores = result.get("scores")
+                if boxes is None or boxes.numel() == 0:
+                    all_masks.append(torch.zeros((height, width), dtype=torch.float32))
+                    all_detections.append({"frame_index": i, "detections": []})
+                    continue
+
+                boxes_cpu = boxes.detach().cpu()
+                mask = self._boxes_to_mask(boxes_cpu, height, width)
+                all_masks.append(mask)
+
+                frame_items = []
+                for idx in range(boxes_cpu.shape[0]):
+                    frame_items.append(
+                        {
+                            "label": str(labels[idx]),
+                            "score": float(scores[idx].item()),
+                            "box_xyxy": [float(v) for v in boxes_cpu[idx].tolist()],
+                        }
+                    )
+                all_detections.append({"frame_index": i, "detections": frame_items})
+
+        if not keep_model_loaded:
+            model.to(mm.unet_offload_device())
+            mm.soft_empty_cache()
+
+        mask_tensor = torch.stack(all_masks, dim=0).to(mm.intermediate_device())
+        return (mask_tensor, json.dumps(all_detections))
+
+
 NODE_CLASS_MAPPINGS = {
     "OpenShotDownloadAndLoadSAM2Model": OpenShotDownloadAndLoadSAM2Model,
     "OpenShotSam2Segmentation": OpenShotSam2Segmentation,
     "OpenShotSam2VideoSegmentationAddPoints": OpenShotSam2VideoSegmentationAddPoints,
     "OpenShotSam2VideoSegmentationChunked": OpenShotSam2VideoSegmentationChunked,
     "OpenShotImageBlurMasked": OpenShotImageBlurMasked,
+    "OpenShotGroundingDinoDetect": OpenShotGroundingDinoDetect,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1016,4 +1167,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OpenShotSam2VideoSegmentationAddPoints": "OpenShot SAM2 Add Video Points",
     "OpenShotSam2VideoSegmentationChunked": "OpenShot SAM2 Video Segmentation (Chunked)",
     "OpenShotImageBlurMasked": "OpenShot Blur Masked (Skip Empty)",
+    "OpenShotGroundingDinoDetect": "OpenShot GroundingDINO Detect",
 }
