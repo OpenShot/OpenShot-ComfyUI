@@ -380,6 +380,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
             },
             "optional": {
                 "image": ("IMAGE",),
+                "video_path": ("STRING", {"default": ""}),
                 "coordinates_negative": ("STRING", {"forceInput": True}),
                 "prev_inference_state": ("SAM2INFERENCESTATE",),
             },
@@ -397,6 +398,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
         frame_index,
         object_index,
         image=None,
+        video_path="",
         coordinates_negative=None,
         prev_inference_state=None,
     ):
@@ -406,8 +408,8 @@ class OpenShotSam2VideoSegmentationAddPoints:
         segmentor = sam2_model.get("segmentor", "video")
         if segmentor != "video":
             raise ValueError("Loaded SAM2 model is not configured for video")
-        if image is None and prev_inference_state is None:
-            raise ValueError("Image input is required for initial inference state")
+        if (image is None and not str(video_path or "").strip()) and prev_inference_state is None:
+            raise ValueError("Image or video_path input is required for initial inference state")
 
         pos = _parse_points(coordinates_positive)
         if not pos:
@@ -422,28 +424,45 @@ class OpenShotSam2VideoSegmentationAddPoints:
 
         model.to(device)
         if prev_inference_state is None:
-            b, h, w, _c = image.shape
-            if hasattr(model, "image_size"):
-                size = int(model.image_size)
-                image = common_upscale(image.movedim(-1, 1), size, size, "bilinear", "disabled").movedim(1, -1)
-            video_tensor = image.permute(0, 3, 1, 2).contiguous()
             # Support SAM2 API variants for init_state signature.
             init_errors = []
             state = None
-            for call in (
-                lambda: model.init_state(video_tensor, h, w, device=device),
-                lambda: model.init_state(video_tensor, h, w),
-                lambda: model.init_state(video_tensor, device=device),
-                lambda: model.init_state(video_tensor),
-            ):
-                try:
-                    state = call()
-                    break
-                except Exception as ex:
-                    init_errors.append(str(ex))
+            num_frames = 0
+
+            # Preferred path for newer SAM2 video predictors: initialize from source video path.
+            if str(video_path or "").strip():
+                vp = str(video_path).strip()
+                for call in (
+                    lambda: model.init_state(vp, device=device),
+                    lambda: model.init_state(vp),
+                ):
+                    try:
+                        state = call()
+                        break
+                    except Exception as ex:
+                        init_errors.append(str(ex))
+
+            # Fallback for tensor-accepting SAM2 variants.
+            if state is None and image is not None:
+                b, h, w, _c = image.shape
+                if hasattr(model, "image_size"):
+                    size = int(model.image_size)
+                    image = common_upscale(image.movedim(-1, 1), size, size, "bilinear", "disabled").movedim(1, -1)
+                video_tensor = image.permute(0, 3, 1, 2).contiguous()
+                for call in (
+                    lambda: model.init_state(video_tensor, h, w, device=device),
+                    lambda: model.init_state(video_tensor, h, w),
+                    lambda: model.init_state(video_tensor, device=device),
+                    lambda: model.init_state(video_tensor),
+                ):
+                    try:
+                        state = call()
+                        num_frames = int(b)
+                        break
+                    except Exception as ex:
+                        init_errors.append(str(ex))
             if state is None:
                 raise RuntimeError("Failed SAM2 init_state across signature variants: {}".format(init_errors))
-            num_frames = int(b)
         else:
             state = prev_inference_state["inference_state"]
             num_frames = int(prev_inference_state.get("num_frames", 0) or 0)
