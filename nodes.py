@@ -570,33 +570,34 @@ class OpenShotSam2VideoSegmentationAddPoints:
 
         autocast_device = mm.get_autocast_device(device)
         autocast_ok = not mm.is_device_mps(device)
-        with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-            add_errors = []
-            added = False
-            for call in (
-                lambda: model.add_new_points(
-                    inference_state=state,
-                    frame_idx=int(frame_index),
-                    obj_id=int(object_index),
-                    points=coords,
-                    labels=labels,
-                ),
-                lambda: model.add_new_points_or_box(
-                    inference_state=state,
-                    frame_idx=int(frame_index),
-                    obj_id=int(object_index),
-                    points=coords,
-                    labels=labels,
-                ),
-            ):
-                try:
-                    call()
-                    added = True
-                    break
-                except Exception as ex:
-                    add_errors.append(str(ex))
-            if not added:
-                raise RuntimeError("Failed SAM2 add points across API variants: {}".format(add_errors))
+        with torch.inference_mode():
+            with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
+                add_errors = []
+                added = False
+                for call in (
+                    lambda: model.add_new_points(
+                        inference_state=state,
+                        frame_idx=int(frame_index),
+                        obj_id=int(object_index),
+                        points=coords,
+                        labels=labels,
+                    ),
+                    lambda: model.add_new_points_or_box(
+                        inference_state=state,
+                        frame_idx=int(frame_index),
+                        obj_id=int(object_index),
+                        points=coords,
+                        labels=labels,
+                    ),
+                ):
+                    try:
+                        call()
+                        added = True
+                        break
+                    except Exception as ex:
+                        add_errors.append(str(ex))
+                if not added:
+                    raise RuntimeError("Failed SAM2 add points across API variants: {}".format(add_errors))
 
         if num_frames <= 0:
             try:
@@ -700,36 +701,37 @@ class OpenShotSam2VideoSegmentationChunked:
 
         out_chunks = []
         progress = ProgressBar(effective_chunk)
-        with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-            try:
-                iterator = model.propagate_in_video(
-                    state,
-                    start_frame_idx=current_start,
-                    max_frame_num_to_track=effective_chunk,
-                )
-            except TypeError:
-                iterator = model.propagate_in_video(state)
+        with torch.inference_mode():
+            with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
+                try:
+                    iterator = model.propagate_in_video(
+                        state,
+                        start_frame_idx=current_start,
+                        max_frame_num_to_track=effective_chunk,
+                    )
+                except TypeError:
+                    iterator = model.propagate_in_video(state)
 
-            end_frame = current_start + effective_chunk
-            for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
-                idx = int(out_frame_idx)
-                if idx < current_start:
-                    continue
-                if idx >= end_frame:
-                    break
+                end_frame = current_start + effective_chunk
+                for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+                    idx = int(out_frame_idx)
+                    if idx < current_start:
+                        continue
+                    if idx >= end_frame:
+                        break
 
-                combined = None
-                for i, _obj_id in enumerate(out_obj_ids):
-                    current = out_mask_logits[i, 0] > 0.0
-                    combined = current if combined is None else torch.logical_or(combined, current)
+                    combined = None
+                    for i, _obj_id in enumerate(out_obj_ids):
+                        current = out_mask_logits[i, 0] > 0.0
+                        combined = current if combined is None else torch.logical_or(combined, current)
 
-                if combined is None:
-                    _n, _c, h, w = out_mask_logits.shape
-                    combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+                    if combined is None:
+                        _n, _c, h, w = out_mask_logits.shape
+                        combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
 
-                out_chunks.append(combined.float().cpu())
-                progress.update(1)
-                del out_mask_logits
+                    out_chunks.append(combined.float().cpu())
+                    progress.update(1)
+                    del out_mask_logits
 
         if not out_chunks:
             raise RuntimeError(
@@ -738,6 +740,12 @@ class OpenShotSam2VideoSegmentationChunked:
             )
 
         inference_state["next_frame_idx"] = current_start + len(out_chunks)
+        if total_frames > 0 and inference_state["next_frame_idx"] >= total_frames:
+            if hasattr(model, "reset_state"):
+                try:
+                    model.reset_state(state)
+                except Exception:
+                    pass
 
         if not keep_model_loaded:
             model.to(mm.unet_offload_device())
