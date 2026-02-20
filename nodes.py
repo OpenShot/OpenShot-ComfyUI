@@ -205,6 +205,33 @@ def _parse_points(text):
     return pts
 
 
+def _resolve_video_path_for_sam2(path_text):
+    """Resolve Comfy-style path text to an absolute local file path for SAM2 video predictor."""
+    path_text = str(path_text or "").strip()
+    if not path_text:
+        return ""
+    if os.path.isabs(path_text) and os.path.exists(path_text):
+        return path_text
+
+    # Handles plain names and annotated names like "clip.mp4 [input]".
+    try:
+        resolved = folder_paths.get_annotated_filepath(path_text)
+        if resolved and os.path.exists(resolved):
+            return resolved
+    except Exception:
+        pass
+
+    # Fallback to Comfy input directory.
+    try:
+        candidate = os.path.join(folder_paths.get_input_directory(), path_text)
+        if os.path.exists(candidate):
+            return candidate
+    except Exception:
+        pass
+
+    return path_text
+
+
 def _build_sam2_video_predictor(config_name, checkpoint, torch_device):
     """Build a SAM2 video predictor across package variants."""
     if sam2_build is None:
@@ -431,7 +458,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
 
             # Preferred path for newer SAM2 video predictors: initialize from source video path.
             if str(video_path or "").strip():
-                vp = str(video_path).strip()
+                vp = _resolve_video_path_for_sam2(video_path)
                 for call in (
                     lambda: model.init_state(vp, device=device),
                     lambda: model.init_state(vp),
