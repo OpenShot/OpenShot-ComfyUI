@@ -628,6 +628,7 @@ class OpenShotSam2VideoSegmentationChunked:
             "required": {
                 "sam2_model": ("SAM2MODEL",),
                 "inference_state": ("SAM2INFERENCESTATE",),
+                "image": ("IMAGE",),
                 "start_frame": ("INT", {"default": 0, "min": 0}),
                 "chunk_size_frames": ("INT", {"default": 32, "min": 1, "max": 4096}),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
@@ -662,7 +663,7 @@ class OpenShotSam2VideoSegmentationChunked:
                 pass
         return int(fallback)
 
-    def segment_chunk(self, sam2_model, inference_state, start_frame, chunk_size_frames, keep_model_loaded, meta_batch=None):
+    def segment_chunk(self, sam2_model, inference_state, image, start_frame, chunk_size_frames, keep_model_loaded, meta_batch=None):
         model = sam2_model["model"]
         device = sam2_model["device"]
         dtype = sam2_model["dtype"]
@@ -673,6 +674,11 @@ class OpenShotSam2VideoSegmentationChunked:
         state = inference_state["inference_state"]
         chunk_size_frames = int(max(1, chunk_size_frames))
         effective_chunk = self._get_frames_per_batch(meta_batch, chunk_size_frames)
+        # Force this node to track VHS chunking cadence exactly.
+        try:
+            effective_chunk = min(effective_chunk, int(image.shape[0]))
+        except Exception:
+            pass
 
         # Persist frame cursor inside the shared inference_state object so each
         # meta-batch call continues from the prior chunk without recomputing frame 0.
