@@ -525,9 +525,13 @@ class OpenShotSam2VideoSegmentationAddPoints:
                         os.path.splitext(vp)[1].lower(),
                     )
                 )
+                # Prefer CPU-offloaded inference state to avoid huge VRAM spikes on long videos.
                 for call in (
-                    lambda: model.init_state(vp, device=device),
+                    lambda: model.init_state(vp, offload_video_to_cpu=True, offload_state_to_cpu=True),
+                    lambda: model.init_state(vp, offload_video_to_cpu=True),
+                    lambda: model.init_state(vp, offload_state_to_cpu=True),
                     lambda: model.init_state(vp),
+                    lambda: model.init_state(vp, device=device),
                 ):
                     try:
                         state = call()
