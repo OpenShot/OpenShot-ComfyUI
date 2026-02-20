@@ -598,11 +598,21 @@ class OpenShotSam2VideoSegmentationAddPoints:
             if not added:
                 raise RuntimeError("Failed SAM2 add points across API variants: {}".format(add_errors))
 
+        if num_frames <= 0:
+            try:
+                num_frames = int(state.get("num_frames", 0) or 0)
+            except Exception:
+                try:
+                    num_frames = int(getattr(state, "num_frames", 0) or 0)
+                except Exception:
+                    num_frames = 0
+
         return (
             sam2_model,
             {
                 "inference_state": state,
                 "num_frames": num_frames,
+                "next_frame_idx": int(max(0, frame_index)),
             },
         )
 
@@ -622,6 +632,9 @@ class OpenShotSam2VideoSegmentationChunked:
                 "chunk_size_frames": ("INT", {"default": 32, "min": 1, "max": 4096}),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
             },
+            "optional": {
+                "meta_batch": ("VHS_BatchManager",),
+            },
         }
 
     RETURN_TYPES = ("MASK",)
@@ -629,7 +642,27 @@ class OpenShotSam2VideoSegmentationChunked:
     FUNCTION = "segment_chunk"
     CATEGORY = "OpenShot/SAM2"
 
-    def segment_chunk(self, sam2_model, inference_state, start_frame, chunk_size_frames, keep_model_loaded):
+    def _get_frames_per_batch(self, meta_batch, fallback):
+        if meta_batch is None:
+            return int(fallback)
+        if isinstance(meta_batch, dict):
+            for key in ("frames_per_batch", "batch_size", "frames"):
+                try:
+                    if key in meta_batch and int(meta_batch[key]) > 0:
+                        return int(meta_batch[key])
+                except Exception:
+                    pass
+        for name in ("frames_per_batch", "batch_size", "frames"):
+            try:
+                value = getattr(meta_batch, name)
+                value = int(value)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+        return int(fallback)
+
+    def segment_chunk(self, sam2_model, inference_state, start_frame, chunk_size_frames, keep_model_loaded, meta_batch=None):
         model = sam2_model["model"]
         device = sam2_model["device"]
         dtype = sam2_model["dtype"]
@@ -638,31 +671,45 @@ class OpenShotSam2VideoSegmentationChunked:
             raise ValueError("Loaded SAM2 model is not configured for video")
 
         state = inference_state["inference_state"]
-        start_frame = int(max(0, start_frame))
         chunk_size_frames = int(max(1, chunk_size_frames))
+        effective_chunk = self._get_frames_per_batch(meta_batch, chunk_size_frames)
+
+        # Persist frame cursor inside the shared inference_state object so each
+        # meta-batch call continues from the prior chunk without recomputing frame 0.
+        if "next_frame_idx" not in inference_state:
+            inference_state["next_frame_idx"] = int(max(0, start_frame))
+        current_start = int(max(0, inference_state.get("next_frame_idx", start_frame)))
+
+        total_frames = int(inference_state.get("num_frames", 0) or 0)
+        if total_frames > 0:
+            remaining = max(0, total_frames - current_start)
+            effective_chunk = min(effective_chunk, remaining) if remaining > 0 else 0
+
+        if effective_chunk <= 0:
+            raise RuntimeError("No remaining SAM2 frames to process (cursor at end of video)")
 
         model.to(device)
         autocast_device = mm.get_autocast_device(device)
         autocast_ok = not mm.is_device_mps(device)
 
         out_chunks = []
-        progress = ProgressBar(chunk_size_frames)
+        progress = ProgressBar(effective_chunk)
         with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-            # Preferred path if SAM2 API supports bounded propagation args.
             try:
                 iterator = model.propagate_in_video(
                     state,
-                    start_frame_idx=start_frame,
-                    max_frame_num_to_track=chunk_size_frames,
+                    start_frame_idx=current_start,
+                    max_frame_num_to_track=effective_chunk,
                 )
             except TypeError:
                 iterator = model.propagate_in_video(state)
 
+            end_frame = current_start + effective_chunk
             for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
                 idx = int(out_frame_idx)
-                if idx < start_frame:
+                if idx < current_start:
                     continue
-                if idx >= (start_frame + chunk_size_frames):
+                if idx >= end_frame:
                     break
 
                 combined = None
@@ -679,7 +726,12 @@ class OpenShotSam2VideoSegmentationChunked:
                 del out_mask_logits
 
         if not out_chunks:
-            raise RuntimeError("SAM2 chunk produced no frames. Check start_frame/chunk_size and inference state.")
+            raise RuntimeError(
+                "SAM2 chunk produced no frames. Check cursor/chunk size and inference state. "
+                "cursor={} chunk={} total={}".format(current_start, effective_chunk, total_frames)
+            )
+
+        inference_state["next_frame_idx"] = current_start + len(out_chunks)
 
         if not keep_model_loaded:
             model.to(mm.unet_offload_device())
