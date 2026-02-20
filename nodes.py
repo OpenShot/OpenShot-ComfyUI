@@ -1,5 +1,7 @@
 import json
 import os
+import hashlib
+import subprocess
 from contextlib import nullcontext
 from urllib.parse import urlparse
 
@@ -27,7 +29,7 @@ else:
 
 
 SAM2_MODEL_DIR = "sam2"
-OPENSHOT_NODEPACK_VERSION = "v1.0.1-hydra-local-config"
+OPENSHOT_NODEPACK_VERSION = "v1.0.3-auto-mp4-convert"
 SAM2_MODELS = {
     "sam2.1_hiera_tiny.safetensors": {
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
@@ -238,6 +240,53 @@ def _resolve_video_path_for_sam2(path_text):
         pass
 
     return path_text
+
+
+def _ensure_mp4_for_sam2(video_path):
+    """Convert non-MP4 input videos to MP4 for SAM2VideoPredictor compatibility."""
+    video_path = str(video_path or "").strip()
+    if not video_path:
+        return video_path
+    ext = os.path.splitext(video_path)[1].lower()
+    if ext == ".mp4":
+        return video_path
+    if not os.path.isfile(video_path):
+        return video_path
+
+    cache_dir = os.path.join(folder_paths.get_temp_directory(), "openshot_sam2_mp4_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    st = os.stat(video_path)
+    key = "{}|{}|{}".format(video_path, int(st.st_mtime_ns), int(st.st_size))
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    out_path = os.path.join(cache_dir, "{}.mp4".format(digest))
+    if os.path.exists(out_path):
+        return out_path
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found; required to convert '{}' to MP4".format(video_path))
+    except subprocess.CalledProcessError as ex:
+        err = (ex.stderr or "").strip()
+        if len(err) > 500:
+            err = err[:500] + "...(truncated)"
+        raise RuntimeError("ffmpeg conversion to MP4 failed: {}".format(err))
+    return out_path
 
 
 def _build_sam2_video_predictor(config_name, checkpoint, torch_device):
@@ -467,6 +516,15 @@ class OpenShotSam2VideoSegmentationAddPoints:
             # Preferred path for newer SAM2 video predictors: initialize from source video path.
             if str(video_path or "").strip():
                 vp = _resolve_video_path_for_sam2(video_path)
+                vp = _ensure_mp4_for_sam2(vp)
+                print(
+                    "[OpenShot-ComfyUI:{}] SAM2 init_state path='{}' exists={} ext='{}'".format(
+                        OPENSHOT_NODEPACK_VERSION,
+                        vp,
+                        os.path.exists(vp),
+                        os.path.splitext(vp)[1].lower(),
+                    )
+                )
                 for call in (
                     lambda: model.init_state(vp, device=device),
                     lambda: model.init_state(vp),
@@ -497,12 +555,13 @@ class OpenShotSam2VideoSegmentationAddPoints:
                     except Exception as ex:
                         init_errors.append(str(ex))
             if state is None:
+                short_errors = init_errors[:2]
                 raise RuntimeError(
-                    "Failed SAM2 init_state across signature variants: {} | resolved_video_path='{}' exists={} ext='{}'".format(
-                        init_errors,
+                    "SAM2 init_state failed; path='{}' exists={} ext='{}' errors={}".format(
                         vp if str(video_path or "").strip() else "",
                         (os.path.exists(vp) if str(video_path or "").strip() else False),
                         (os.path.splitext(vp)[1].lower() if str(video_path or "").strip() else ""),
+                        short_errors,
                     )
                 )
         else:
