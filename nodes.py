@@ -56,8 +56,36 @@ def _model_storage_dir():
     return path
 
 
+def _safe_get_filename_list(model_dir_name):
+    try:
+        return list(folder_paths.get_filename_list(model_dir_name) or [])
+    except Exception:
+        # Folder key may not be registered in some Comfy installs.
+        path = os.path.join(folder_paths.models_dir, model_dir_name)
+        if not os.path.isdir(path):
+            return []
+        return sorted(
+            name
+            for name in os.listdir(path)
+            if os.path.isfile(os.path.join(path, name))
+        )
+
+
+def _safe_get_full_path(model_dir_name, name):
+    try:
+        full = folder_paths.get_full_path(model_dir_name, name)
+        if full:
+            return full
+    except Exception:
+        pass
+    fallback = os.path.join(folder_paths.models_dir, model_dir_name, name)
+    if os.path.exists(fallback):
+        return fallback
+    return ""
+
+
 def _model_options():
-    available = set(folder_paths.get_filename_list(SAM2_MODEL_DIR) or [])
+    available = set(_safe_get_filename_list(SAM2_MODEL_DIR))
     merged = list(SAM2_MODELS.keys())
     for name in sorted(available):
         if name not in merged:
@@ -70,7 +98,7 @@ def _download_if_needed(model_name):
     if not model_name:
         raise ValueError("Model name is required")
 
-    full_path = folder_paths.get_full_path(SAM2_MODEL_DIR, model_name)
+    full_path = _safe_get_full_path(SAM2_MODEL_DIR, model_name)
     if full_path and os.path.exists(full_path):
         return full_path
 
