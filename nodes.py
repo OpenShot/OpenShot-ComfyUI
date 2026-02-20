@@ -210,6 +210,10 @@ def _resolve_video_path_for_sam2(path_text):
     path_text = str(path_text or "").strip()
     if not path_text:
         return ""
+    # Strip Comfy annotation suffixes if present.
+    if path_text.endswith("]") and " [" in path_text:
+        path_text = path_text.rsplit(" [", 1)[0].strip()
+
     if os.path.isabs(path_text) and os.path.exists(path_text):
         return path_text
 
@@ -226,6 +230,10 @@ def _resolve_video_path_for_sam2(path_text):
         candidate = os.path.join(folder_paths.get_input_directory(), path_text)
         if os.path.exists(candidate):
             return candidate
+        # fallback to basename if caller passed nested/odd relative path tokens
+        candidate2 = os.path.join(folder_paths.get_input_directory(), os.path.basename(path_text))
+        if os.path.exists(candidate2):
+            return candidate2
     except Exception:
         pass
 
@@ -489,7 +497,14 @@ class OpenShotSam2VideoSegmentationAddPoints:
                     except Exception as ex:
                         init_errors.append(str(ex))
             if state is None:
-                raise RuntimeError("Failed SAM2 init_state across signature variants: {}".format(init_errors))
+                raise RuntimeError(
+                    "Failed SAM2 init_state across signature variants: {} | resolved_video_path='{}' exists={} ext='{}'".format(
+                        init_errors,
+                        vp if str(video_path or "").strip() else "",
+                        (os.path.exists(vp) if str(video_path or "").strip() else False),
+                        (os.path.splitext(vp)[1].lower() if str(video_path or "").strip() else ""),
+                    )
+                )
         else:
             state = prev_inference_state["inference_state"]
             num_frames = int(prev_inference_state.get("num_frames", 0) or 0)
