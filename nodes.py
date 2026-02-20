@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.hub import download_url_to_file
 
 import comfy.model_management as mm
@@ -29,7 +30,7 @@ else:
 
 
 SAM2_MODEL_DIR = "sam2"
-OPENSHOT_NODEPACK_VERSION = "v1.0.3-auto-mp4-convert"
+OPENSHOT_NODEPACK_VERSION = "v1.0.4-masked-blur-skip-empty"
 SAM2_MODELS = {
     "sam2.1_hiera_tiny.safetensors": {
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
@@ -461,6 +462,8 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 "coordinates_positive": ("STRING", {"forceInput": True}),
                 "frame_index": ("INT", {"default": 0, "min": 0}),
                 "object_index": ("INT", {"default": 0, "min": 0}),
+                "offload_video_to_cpu": ("BOOLEAN", {"default": True}),
+                "offload_state_to_cpu": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -481,6 +484,8 @@ class OpenShotSam2VideoSegmentationAddPoints:
         coordinates_positive,
         frame_index,
         object_index,
+        offload_video_to_cpu,
+        offload_state_to_cpu,
         image=None,
         video_path="",
         coordinates_negative=None,
@@ -527,9 +532,13 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 )
                 # Prefer CPU-offloaded inference state to avoid huge VRAM spikes on long videos.
                 for call in (
-                    lambda: model.init_state(vp, offload_video_to_cpu=True, offload_state_to_cpu=True),
-                    lambda: model.init_state(vp, offload_video_to_cpu=True),
-                    lambda: model.init_state(vp, offload_state_to_cpu=True),
+                    lambda: model.init_state(
+                        vp,
+                        offload_video_to_cpu=bool(offload_video_to_cpu),
+                        offload_state_to_cpu=bool(offload_state_to_cpu),
+                    ),
+                    lambda: model.init_state(vp, offload_video_to_cpu=bool(offload_video_to_cpu)),
+                    lambda: model.init_state(vp, offload_state_to_cpu=bool(offload_state_to_cpu)),
                     lambda: model.init_state(vp),
                     lambda: model.init_state(vp, device=device),
                 ):
@@ -758,11 +767,78 @@ class OpenShotSam2VideoSegmentationChunked:
         return (torch.stack(out_chunks, dim=0),)
 
 
+def _gaussian_kernel(kernel_size, sigma, device, dtype):
+    axis = torch.linspace(-1, 1, kernel_size, device=device, dtype=dtype)
+    x, y = torch.meshgrid(axis, axis, indexing="ij")
+    d = torch.sqrt(x * x + y * y)
+    g = torch.exp(-(d * d) / (2.0 * sigma * sigma))
+    return g / g.sum()
+
+
+class OpenShotImageBlurMasked:
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return ""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "blur_radius": ("INT", {"default": 12, "min": 0, "max": 64, "step": 1}),
+                "sigma": ("FLOAT", {"default": 4.0, "min": 0.1, "max": 20.0, "step": 0.1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "blur_masked"
+    CATEGORY = "OpenShot/Video"
+
+    def blur_masked(self, image, mask, blur_radius, sigma):
+        blur_radius = int(max(0, blur_radius))
+        if blur_radius == 0:
+            return (image,)
+
+        device = mm.get_torch_device()
+        img = image.to(device)
+        m = mask.to(device).float()
+        if m.ndim == 3:
+            m = m.unsqueeze(-1)
+        m = torch.clamp(m, 0.0, 1.0)
+
+        has_mask = (m.view(m.shape[0], -1).max(dim=1).values > 0)
+        if not bool(has_mask.any()):
+            return (image,)
+
+        out = img.clone()
+        idx = torch.nonzero(has_mask, as_tuple=False).squeeze(1)
+        work = img[idx]
+        work_mask = m[idx]
+
+        kernel_size = blur_radius * 2 + 1
+        kernel = _gaussian_kernel(kernel_size, float(sigma), device=work.device, dtype=work.dtype)
+        kernel = kernel.repeat(work.shape[-1], 1, 1).unsqueeze(1)
+
+        work_nchw = work.permute(0, 3, 1, 2)
+        padded = F.pad(work_nchw, (blur_radius, blur_radius, blur_radius, blur_radius), "reflect")
+        blurred = F.conv2d(padded, kernel, padding=kernel_size // 2, groups=work.shape[-1])[
+            :, :, blur_radius:-blur_radius, blur_radius:-blur_radius
+        ]
+        blurred = blurred.permute(0, 2, 3, 1)
+
+        composited = work * (1.0 - work_mask) + blurred * work_mask
+        out[idx] = composited
+        return (out.to(mm.intermediate_device()),)
+
+
 NODE_CLASS_MAPPINGS = {
     "OpenShotDownloadAndLoadSAM2Model": OpenShotDownloadAndLoadSAM2Model,
     "OpenShotSam2Segmentation": OpenShotSam2Segmentation,
     "OpenShotSam2VideoSegmentationAddPoints": OpenShotSam2VideoSegmentationAddPoints,
     "OpenShotSam2VideoSegmentationChunked": OpenShotSam2VideoSegmentationChunked,
+    "OpenShotImageBlurMasked": OpenShotImageBlurMasked,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -770,4 +846,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OpenShotSam2Segmentation": "OpenShot SAM2 Segmentation (Image)",
     "OpenShotSam2VideoSegmentationAddPoints": "OpenShot SAM2 Add Video Points",
     "OpenShotSam2VideoSegmentationChunked": "OpenShot SAM2 Video Segmentation (Chunked)",
+    "OpenShotImageBlurMasked": "OpenShot Blur Masked (Skip Empty)",
 }
