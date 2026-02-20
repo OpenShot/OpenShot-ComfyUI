@@ -2,6 +2,9 @@
 numpy>=1.24
 Pillow>=9.0
 hydra-core>=1.3
-# SAM2 upstream package
-# NOTE: this may pull torch-related dependencies depending on environment.
-git+https://github.com/facebookresearch/sam2.git
+decord
+
+# IMPORTANT:
+# SAM2 is intentionally NOT installed from this file to avoid repeated
+# large git downloads during normal dependency updates.
+# Ensure your Comfy environment already has a compatible `sam2` installed.

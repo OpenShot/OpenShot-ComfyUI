@@ -28,9 +28,22 @@ Please see upstream projects for full original implementations and credits.
 
 - ComfyUI
 - PyTorch (as used by your Comfy install)
-- `sam2` Python package / module available to Comfy runtime
+- `decord` (required by many SAM2 video predictor builds)
+- `sam2` Python package/module available in your Comfy runtime
 
 Install this node pack into `ComfyUI/custom_nodes/OpenShot-ComfyUI` and restart ComfyUI.
+
+### Install dependencies
+
+```bash
+/home/jonathan/miniforge3/envs/comfyui/bin/python -m pip install -r /home/jonathan/apps/ComfyUI/custom_nodes/OpenShot-ComfyUI/requirements.txt
+```
+
+### Important note about SAM2 installs
+
+`requirements.txt` intentionally does **not** install SAM2 from Git. This avoids repeated large temporary downloads and long install times during routine updates.
+
+Ensure your Comfy environment already has a compatible `sam2` installed.
 
 ## Models
 
