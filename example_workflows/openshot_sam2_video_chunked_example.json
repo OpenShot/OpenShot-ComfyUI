@@ -1,0 +1,34 @@
+{
+  "note": "Example skeleton only. Wire image/video inputs from your own workflow.",
+  "workflow": {
+    "1": {
+      "class_type": "OpenShotDownloadAndLoadSAM2Model",
+      "inputs": {
+        "model": "sam2.1_hiera_tiny.safetensors",
+        "segmentor": "video",
+        "device": "auto",
+        "precision": "fp16"
+      }
+    },
+    "2": {
+      "class_type": "OpenShotSam2VideoSegmentationAddPoints",
+      "inputs": {
+        "sam2_model": ["1", 0],
+        "image": ["YOUR_VIDEO_FRAMES_NODE", 0],
+        "coordinates_positive": "[{\"x\":320,\"y\":180}]",
+        "frame_index": 0,
+        "object_index": 0
+      }
+    },
+    "3": {
+      "class_type": "OpenShotSam2VideoSegmentationChunked",
+      "inputs": {
+        "sam2_model": ["2", 0],
+        "inference_state": ["2", 1],
+        "start_frame": 0,
+        "chunk_size_frames": 32,
+        "keep_model_loaded": false
+      }
+    }
+  }
+}

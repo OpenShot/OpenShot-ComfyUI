@@ -1,0 +1,138 @@
+{
+  "name": "OpenShot Blur Anything (SAM2 Chunk Worker)",
+  "template_id": "openshot-video-blur-anything-sam2-chunk-worker",
+  "description": "Processes a bounded frame chunk using OpenShot SAM2 nodes. Intended for repeated chunk execution by OpenShot orchestration.",
+  "workflow": {
+    "1": {
+      "class_type": "VHS_LoadVideo",
+      "inputs": {
+        "video": "__openshot_input__",
+        "force_rate": 0,
+        "custom_width": 0,
+        "custom_height": 0,
+        "frame_load_cap": 0,
+        "skip_first_frames": 0,
+        "select_every_nth": 1
+      }
+    },
+    "2": {
+      "class_type": "VHS_VideoInfoLoaded",
+      "inputs": {
+        "video_info": [
+          "1",
+          3
+        ]
+      }
+    },
+    "3": {
+      "class_type": "OpenShotDownloadAndLoadSAM2Model",
+      "inputs": {
+        "model": "sam2.1_hiera_tiny.safetensors",
+        "segmentor": "video",
+        "device": "auto",
+        "precision": "fp16"
+      }
+    },
+    "4": {
+      "class_type": "OpenShotSam2VideoSegmentationAddPoints",
+      "inputs": {
+        "sam2_model": [
+          "3",
+          0
+        ],
+        "image": [
+          "1",
+          0
+        ],
+        "coordinates_positive": "[{\"x\": 320, \"y\": 180}]",
+        "frame_index": 0,
+        "object_index": 0
+      }
+    },
+    "5": {
+      "class_type": "OpenShotSam2VideoSegmentationChunked",
+      "inputs": {
+        "sam2_model": [
+          "4",
+          0
+        ],
+        "inference_state": [
+          "4",
+          1
+        ],
+        "start_frame": 0,
+        "chunk_size_frames": 32,
+        "keep_model_loaded": false
+      }
+    },
+    "6": {
+      "class_type": "VHS_LoadVideo",
+      "inputs": {
+        "video": "__openshot_input__",
+        "force_rate": 0,
+        "custom_width": 0,
+        "custom_height": 0,
+        "frame_load_cap": 32,
+        "skip_first_frames": 0,
+        "select_every_nth": 1
+      }
+    },
+    "7": {
+      "class_type": "ImageBlur",
+      "inputs": {
+        "image": [
+          "6",
+          0
+        ],
+        "blur_radius": 12,
+        "sigma": 4.0
+      }
+    },
+    "8": {
+      "class_type": "ImageCompositeMasked",
+      "inputs": {
+        "destination": [
+          "6",
+          0
+        ],
+        "source": [
+          "7",
+          0
+        ],
+        "mask": [
+          "5",
+          0
+        ],
+        "x": 0,
+        "y": 0,
+        "resize_source": false
+      }
+    },
+    "9": {
+      "class_type": "VHS_VideoCombine",
+      "inputs": {
+        "images": [
+          "8",
+          0
+        ],
+        "frame_rate": [
+          "2",
+          0
+        ],
+        "loop_count": 0,
+        "filename_prefix": "video/openshot_chunk_blur",
+        "format": "video/h264-mp4",
+        "pingpong": false,
+        "save_output": true
+      }
+    }
+  },
+  "notes": {
+    "usage": [
+      "This is a chunk-worker workflow. It processes only one chunk per run.",
+      "Set node 5 `start_frame` and node 6 `skip_first_frames` to the same chunk start.",
+      "Set node 5 `chunk_size_frames` and node 6 `frame_load_cap` to the same chunk size.",
+      "OpenShot should execute this repeatedly and concatenate chunk outputs."
+    ]
+  }
+}
