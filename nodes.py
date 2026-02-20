@@ -10,6 +10,8 @@ from torch.hub import download_url_to_file
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, common_upscale
 import folder_paths
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 try:
     from sam2.build_sam import build_sam2
@@ -114,14 +116,46 @@ def _download_if_needed(model_name):
     return target
 
 
-def _resolve_config_name(model_name, checkpoint_path):
+def _resolve_config_candidates(model_name, checkpoint_path):
+    candidates = []
+
     info = SAM2_MODELS.get(model_name)
     if info and info.get("config"):
-        return info["config"]
+        candidates.append(str(info["config"]))
 
-    base = os.path.basename(checkpoint_path).replace(".pt", "").replace("2.1", "2_1")
-    # fallback heuristic
-    return "{}.yaml".format(base)
+    base = os.path.basename(checkpoint_path).replace(".pt", "")
+    variants = {
+        base,
+        base.replace("2.1", "2_1"),
+        base.replace("2.1", "2"),
+        base.replace("sam2.1", "sam2"),
+        base.replace("sam2_1", "sam2"),
+    }
+    for variant in sorted(variants):
+        candidates.append("{}.yaml".format(variant))
+
+    # De-duplicate while preserving order.
+    seen = set()
+    ordered = []
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def _pack_config_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "sam2_configs")
+
+
+def _init_hydra_for_local_configs():
+    cfg_dir = _pack_config_dir()
+    if not os.path.isdir(cfg_dir):
+        raise RuntimeError("OpenShot SAM2 config directory not found: {}".format(cfg_dir))
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    initialize_config_dir(config_dir=cfg_dir, version_base=None)
 
 
 def _to_device_dtype(device_name, precision):
@@ -189,10 +223,27 @@ class OpenShotDownloadAndLoadSAM2Model:
         _require_sam2()
 
         checkpoint = _download_if_needed(model)
-        config_name = _resolve_config_name(model, checkpoint)
+        config_candidates = _resolve_config_candidates(model, checkpoint)
         torch_device, dtype = _to_device_dtype(device, precision)
 
-        sam_model = build_sam2(config_name, checkpoint, device=torch_device)
+        _init_hydra_for_local_configs()
+
+        sam_model = None
+        last_error = None
+        for config_name in config_candidates:
+            try:
+                sam_model = build_sam2(config_name, checkpoint, device=torch_device)
+                break
+            except Exception as ex:
+                last_error = ex
+                # Missing config names are expected across SAM2 package variants.
+                if "Cannot find primary config" in str(ex):
+                    continue
+                raise
+        if sam_model is None:
+            raise RuntimeError(
+                "Failed loading SAM2 model. Tried configs {}. Last error: {}".format(config_candidates, last_error)
+            )
         return ({
             "model": sam_model,
             "device": torch_device,
