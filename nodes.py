@@ -2,6 +2,8 @@ import json
 import os
 import hashlib
 import subprocess
+import shutil
+import time
 from contextlib import nullcontext
 from urllib.parse import urlparse
 
@@ -9,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.hub import download_url_to_file
+from PIL import Image
 
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, common_upscale
@@ -462,8 +465,9 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 "coordinates_positive": ("STRING", {"forceInput": True}),
                 "frame_index": ("INT", {"default": 0, "min": 0}),
                 "object_index": ("INT", {"default": 0, "min": 0}),
-                "offload_video_to_cpu": ("BOOLEAN", {"default": True}),
-                "offload_state_to_cpu": ("BOOLEAN", {"default": True}),
+                "windowed_mode": ("BOOLEAN", {"default": True}),
+                "offload_video_to_cpu": ("BOOLEAN", {"default": False}),
+                "offload_state_to_cpu": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -484,6 +488,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
         coordinates_positive,
         frame_index,
         object_index,
+        windowed_mode,
         offload_video_to_cpu,
         offload_state_to_cpu,
         image=None,
@@ -497,8 +502,6 @@ class OpenShotSam2VideoSegmentationAddPoints:
         segmentor = sam2_model.get("segmentor", "video")
         if segmentor != "video":
             raise ValueError("Loaded SAM2 model is not configured for video")
-        if (image is None and not str(video_path or "").strip()) and prev_inference_state is None:
-            raise ValueError("Image or video_path input is required for initial inference state")
 
         pos = _parse_points(coordinates_positive)
         if not pos:
@@ -510,6 +513,24 @@ class OpenShotSam2VideoSegmentationAddPoints:
 
         coords = np.concatenate((pos_arr, neg_arr), axis=0)
         labels = np.concatenate((np.ones((len(pos_arr),), dtype=np.int32), np.zeros((len(neg_arr),), dtype=np.int32)), axis=0)
+
+        # Windowed mode does not hold full-video SAM2 state in memory.
+        if bool(windowed_mode):
+            state = dict(prev_inference_state or {})
+            state["windowed_mode"] = True
+            state["seed_points"] = coords.tolist()
+            state["seed_labels"] = labels.tolist()
+            state["last_points"] = coords.tolist()
+            state["last_labels"] = labels.tolist()
+            state["object_index"] = int(object_index)
+            state["next_frame_idx"] = int(max(0, frame_index))
+            state["num_frames"] = int(state.get("num_frames", 0) or 0)
+            state["offload_video_to_cpu"] = bool(offload_video_to_cpu)
+            state["offload_state_to_cpu"] = bool(offload_state_to_cpu)
+            return (sam2_model, state)
+
+        if (image is None and not str(video_path or "").strip()) and prev_inference_state is None:
+            raise ValueError("Image or video_path input is required for initial inference state")
 
         model.to(device)
         if prev_inference_state is None:
@@ -677,6 +698,151 @@ class OpenShotSam2VideoSegmentationChunked:
                 pass
         return int(fallback)
 
+    def _write_window_jpegs(self, image):
+        image_np = np.clip((image.detach().cpu().numpy() * 255.0), 0, 255).astype(np.uint8)
+        root = os.path.join(folder_paths.get_temp_directory(), "openshot_sam2_windows")
+        os.makedirs(root, exist_ok=True)
+        name = "w{}_{}".format(int(time.time() * 1000), hashlib.sha256(os.urandom(16)).hexdigest()[:8])
+        window_dir = os.path.join(root, name)
+        os.makedirs(window_dir, exist_ok=True)
+        for i, frame in enumerate(image_np):
+            Image.fromarray(frame[..., :3], mode="RGB").save(
+                os.path.join(window_dir, "{:05d}.jpg".format(i)),
+                format="JPEG",
+                quality=95,
+            )
+        return window_dir, int(image_np.shape[0]), int(image_np.shape[1]), int(image_np.shape[2])
+
+    def _init_window_state(self, model, window_dir, device, inference_state):
+        errs = []
+        offload_video_to_cpu = bool(inference_state.get("offload_video_to_cpu", False))
+        offload_state_to_cpu = bool(inference_state.get("offload_state_to_cpu", False))
+        for call in (
+            lambda: model.init_state(
+                window_dir,
+                offload_video_to_cpu=offload_video_to_cpu,
+                offload_state_to_cpu=offload_state_to_cpu,
+            ),
+            lambda: model.init_state(window_dir, offload_video_to_cpu=offload_video_to_cpu),
+            lambda: model.init_state(window_dir, offload_state_to_cpu=offload_state_to_cpu),
+            lambda: model.init_state(window_dir),
+            lambda: model.init_state(window_dir, device=device),
+        ):
+            try:
+                return call()
+            except Exception as ex:
+                errs.append(str(ex))
+        raise RuntimeError("SAM2 window init_state failed: {}".format(errs[:3]))
+
+    def _add_prompt_points(self, model, local_state, inference_state):
+        points = np.array(inference_state.get("last_points") or inference_state.get("seed_points") or [], dtype=np.float32)
+        labels = np.array(inference_state.get("last_labels") or inference_state.get("seed_labels") or [], dtype=np.int32)
+        if points.size == 0 or labels.size == 0:
+            raise ValueError("Windowed SAM2 tracker has no valid prompt points")
+        if points.ndim == 1:
+            points = points.reshape(1, 2)
+        obj_id = int(inference_state.get("object_index", 0))
+        errors = []
+        for call in (
+            lambda: model.add_new_points(
+                inference_state=local_state,
+                frame_idx=0,
+                obj_id=obj_id,
+                points=points,
+                labels=labels,
+            ),
+            lambda: model.add_new_points_or_box(
+                inference_state=local_state,
+                frame_idx=0,
+                obj_id=obj_id,
+                points=points,
+                labels=labels,
+            ),
+        ):
+            try:
+                call()
+                return
+            except Exception as ex:
+                errors.append(str(ex))
+        raise RuntimeError("Windowed SAM2 add points failed: {}".format(errors))
+
+    def _update_prompt_from_last_mask(self, inference_state, masks):
+        last = None
+        for m in reversed(masks):
+            if torch.any(m > 0.0):
+                last = m
+                break
+        if last is None:
+            return
+        ys, xs = torch.where(last > 0.0)
+        if xs.numel() == 0:
+            return
+        cx = float(xs.float().mean().item())
+        cy = float(ys.float().mean().item())
+        inference_state["last_points"] = [[cx, cy]]
+        inference_state["last_labels"] = [1]
+
+    def _segment_windowed(self, sam2_model, inference_state, image, keep_model_loaded):
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        model.to(device)
+        autocast_device = mm.get_autocast_device(device)
+        autocast_ok = not mm.is_device_mps(device)
+
+        window_dir = None
+        local_state = None
+        out_chunks = []
+        try:
+            window_dir, bsz, h, w = self._write_window_jpegs(image)
+            progress = ProgressBar(bsz)
+            with torch.inference_mode():
+                with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
+                    local_state = self._init_window_state(model, window_dir, device, inference_state)
+                    self._add_prompt_points(model, local_state, inference_state)
+                    try:
+                        iterator = model.propagate_in_video(
+                            local_state,
+                            start_frame_idx=0,
+                            max_frame_num_to_track=bsz,
+                        )
+                    except TypeError:
+                        iterator = model.propagate_in_video(local_state)
+
+                    by_idx = {}
+                    for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+                        idx = int(out_frame_idx)
+                        if idx < 0 or idx >= bsz:
+                            continue
+                        combined = None
+                        for i, _obj_id in enumerate(out_obj_ids):
+                            current = out_mask_logits[i, 0] > 0.0
+                            combined = current if combined is None else torch.logical_or(combined, current)
+                        if combined is None:
+                            combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+                        by_idx[idx] = combined.float().cpu()
+                        progress.update(1)
+                        del out_mask_logits
+
+            for i in range(bsz):
+                out_chunks.append(by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)))
+            self._update_prompt_from_last_mask(inference_state, out_chunks)
+            inference_state["next_frame_idx"] = int(inference_state.get("next_frame_idx", 0) or 0) + bsz
+            inference_state["num_frames"] = int(inference_state.get("num_frames", 0) or 0) + bsz
+        finally:
+            if local_state is not None and hasattr(model, "reset_state"):
+                try:
+                    model.reset_state(local_state)
+                except Exception:
+                    pass
+            if window_dir and os.path.isdir(window_dir):
+                shutil.rmtree(window_dir, ignore_errors=True)
+            if not keep_model_loaded:
+                model.to(mm.unet_offload_device())
+                mm.soft_empty_cache()
+
+        return (torch.stack(out_chunks, dim=0),)
+
     def segment_chunk(self, sam2_model, inference_state, image, start_frame, chunk_size_frames, keep_model_loaded, meta_batch=None):
         model = sam2_model["model"]
         device = sam2_model["device"]
@@ -684,6 +850,9 @@ class OpenShotSam2VideoSegmentationChunked:
         segmentor = sam2_model.get("segmentor", "video")
         if segmentor != "video":
             raise ValueError("Loaded SAM2 model is not configured for video")
+
+        if bool(inference_state.get("windowed_mode", False)):
+            return self._segment_windowed(sam2_model, inference_state, image, keep_model_loaded)
 
         state = inference_state["inference_state"]
         chunk_size_frames = int(max(1, chunk_size_frames))
