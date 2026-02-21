@@ -6,6 +6,7 @@ import shutil
 import time
 from contextlib import nullcontext
 from urllib.parse import urlparse
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -346,6 +347,198 @@ def _build_sam2_video_predictor(config_name, checkpoint, torch_device):
     raise RuntimeError(
         "Could not build SAM2 video predictor. Found builders={} last_error={}".format(found, last_error)
     )
+
+
+def _probe_video_info(path_text):
+    """Probe basic video metadata via ffprobe."""
+    path_text = str(path_text or "").strip()
+    if not path_text:
+        return {}
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate:format=duration",
+        "-of",
+        "json",
+        path_text,
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except Exception:
+        return {}
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except Exception:
+        return {}
+
+    stream = {}
+    streams = payload.get("streams")
+    if isinstance(streams, list) and streams:
+        stream = streams[0] if isinstance(streams[0], dict) else {}
+    fmt = payload.get("format") if isinstance(payload.get("format"), dict) else {}
+
+    def _parse_rate(text_value):
+        text_value = str(text_value or "").strip()
+        if not text_value or text_value in ("0/0", "N/A"):
+            return None
+        if "/" in text_value:
+            try:
+                frac = Fraction(text_value)
+                if frac > 0:
+                    return frac
+            except Exception:
+                return None
+        try:
+            value = float(text_value)
+            if value > 0:
+                return Fraction(value).limit_denominator(1000000)
+        except Exception:
+            return None
+        return None
+
+    fps = _parse_rate(stream.get("avg_frame_rate")) or _parse_rate(stream.get("r_frame_rate"))
+    duration = None
+    try:
+        duration = float(fmt.get("duration"))
+    except Exception:
+        duration = None
+
+    return {
+        "fps": fps,
+        "duration": duration,
+    }
+
+
+class OpenShotSceneRangesFromSegments:
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return ""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "segment_paths": ("*",),
+                "source_video_path": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "fallback_fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 240.0, "step": 0.001}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("scene_ranges_json",)
+    FUNCTION = "build"
+    CATEGORY = "OpenShot/Video"
+
+    def _as_path_list(self, segment_paths):
+        if isinstance(segment_paths, (list, tuple)):
+            return [str(p).strip() for p in segment_paths if str(p or "").strip()]
+        if isinstance(segment_paths, str):
+            text = segment_paths.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(p).strip() for p in parsed if str(p or "").strip()]
+            except Exception:
+                pass
+            return [text]
+        return []
+
+    def _timecode(self, seconds_value, fps_fraction):
+        fps_fraction = fps_fraction if isinstance(fps_fraction, Fraction) and fps_fraction > 0 else Fraction(30, 1)
+        fps_float = float(fps_fraction)
+        total_seconds = max(0.0, float(seconds_value or 0.0))
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        secs = int(total_seconds % 60)
+        frames = int(round((total_seconds - int(total_seconds)) * fps_float))
+        fps_ceiling = int(round(fps_float)) or 1
+        if frames >= fps_ceiling:
+            frames = 0
+            secs += 1
+            if secs >= 60:
+                secs = 0
+                minutes += 1
+                if minutes >= 60:
+                    minutes = 0
+                    hours += 1
+        if hours > 0:
+            return "{:02d}:{:02d}:{:02d};{:02d}".format(hours, minutes, secs, frames)
+        if minutes > 0:
+            return "{:02d}:{:02d};{:02d}".format(minutes, secs, frames)
+        return "{:02d};{:02d}".format(secs, frames)
+
+    def build(self, segment_paths, source_video_path, fallback_fps=30.0):
+        paths = self._as_path_list(segment_paths)
+        if not paths:
+            return (json.dumps({"segments": []}),)
+
+        source_info = _probe_video_info(source_video_path)
+        fps_fraction = source_info.get("fps")
+        if fps_fraction is None or fps_fraction <= 0:
+            try:
+                fps_fraction = Fraction(float(fallback_fps)).limit_denominator(1000000)
+            except Exception:
+                fps_fraction = Fraction(30, 1)
+        fps_float = float(fps_fraction)
+
+        source_duration = source_info.get("duration")
+        running_start = 0.0
+        segments = []
+
+        for idx, segment_path in enumerate(paths, start=1):
+            info = _probe_video_info(segment_path)
+            duration = info.get("duration")
+            if duration is None:
+                continue
+            duration = max(0.0, float(duration))
+            if duration <= 0.0:
+                continue
+            start_seconds = running_start
+            end_seconds = running_start + duration
+            if source_duration is not None:
+                end_seconds = min(end_seconds, float(source_duration))
+            if end_seconds <= start_seconds:
+                continue
+
+            start_frame = int(round(start_seconds * fps_float)) + 1
+            end_frame = int(round(end_seconds * fps_float))
+            if end_frame < start_frame:
+                end_frame = start_frame
+
+            segments.append(
+                {
+                    "index": idx,
+                    "path": str(segment_path),
+                    "start_seconds": round(start_seconds, 6),
+                    "end_seconds": round(end_seconds, 6),
+                    "duration_seconds": round(end_seconds - start_seconds, 6),
+                    "start_frame": int(start_frame),
+                    "end_frame": int(end_frame),
+                    "start_timecode": self._timecode(start_seconds, fps_fraction),
+                    "end_timecode": self._timecode(end_seconds, fps_fraction),
+                }
+            )
+            running_start = end_seconds
+
+        payload = {
+            "version": 1,
+            "source_video_path": str(source_video_path or ""),
+            "fps": {
+                "num": int(fps_fraction.numerator),
+                "den": int(fps_fraction.denominator),
+                "float": fps_float,
+            },
+            "segments": segments,
+        }
+        return (json.dumps(payload),)
 
 
 class OpenShotDownloadAndLoadSAM2Model:
@@ -1159,6 +1352,7 @@ NODE_CLASS_MAPPINGS = {
     "OpenShotSam2VideoSegmentationChunked": OpenShotSam2VideoSegmentationChunked,
     "OpenShotImageBlurMasked": OpenShotImageBlurMasked,
     "OpenShotGroundingDinoDetect": OpenShotGroundingDinoDetect,
+    "OpenShotSceneRangesFromSegments": OpenShotSceneRangesFromSegments,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1168,4 +1362,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OpenShotSam2VideoSegmentationChunked": "OpenShot SAM2 Video Segmentation (Chunked)",
     "OpenShotImageBlurMasked": "OpenShot Blur Masked (Skip Empty)",
     "OpenShotGroundingDinoDetect": "OpenShot GroundingDINO Detect",
+    "OpenShotSceneRangesFromSegments": "OpenShot Scene Ranges From Segments",
 }
