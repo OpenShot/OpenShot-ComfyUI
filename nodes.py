@@ -1309,8 +1309,20 @@ class OpenShotSam2VideoSegmentationAddPoints:
                     float(dino_text_threshold),
                     dino_device,
                 )
-            except Exception:
-                dino_boxes = []
+                print(
+                    "[OpenShot-ComfyUI:{}] DINO prompt='{}' boxes={} model='{}' box_th={} text_th={}".format(
+                        OPENSHOT_NODEPACK_VERSION,
+                        dino_prompt,
+                        len(dino_boxes),
+                        dino_model_id,
+                        float(dino_box_threshold),
+                        float(dino_text_threshold),
+                    )
+                )
+            except Exception as ex:
+                raise RuntimeError(
+                    "GroundingDINO detection failed for prompt '{}': {}".format(dino_prompt, ex)
+                )
             if dino_boxes:
                 seed_entry = dict(prompt_schedule.get(seed_frame_idx, {}) or {})
                 seed_object_prompts = list(seed_entry.get("object_prompts") or [])
