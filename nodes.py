@@ -51,7 +51,7 @@ else:
 
 
 SAM2_MODEL_DIR = "sam2"
-OPENSHOT_NODEPACK_VERSION = "v1.1.0-track-object-seeds"
+OPENSHOT_NODEPACK_VERSION = "v1.1.2-track-object-keyframes"
 GROUNDING_DINO_MODEL_IDS = (
     "IDEA-Research/grounding-dino-tiny",
     "IDEA-Research/grounding-dino-base",
@@ -285,6 +285,104 @@ def _parse_rects(text):
             continue
         out.append((x1, y1, x2, y2))
     return out
+
+
+def _parse_tracking_selection(text):
+    text = str(text or "").strip()
+    if not text:
+        return {"seed_frame_idx": 0, "schedule": {}}
+    try:
+        parsed = json.loads(text.replace("'", '"'))
+    except Exception:
+        return {"seed_frame_idx": 0, "schedule": {}}
+    if not isinstance(parsed, dict):
+        return {"seed_frame_idx": 0, "schedule": {}}
+
+    try:
+        seed_frame_idx = max(0, int(parsed.get("seed_frame", 1)) - 1)
+    except Exception:
+        seed_frame_idx = 0
+
+    frames = parsed.get("frames", {})
+    if not isinstance(frames, dict):
+        frames = {}
+
+    schedule = {}
+    for frame_key, frame_data in frames.items():
+        if not isinstance(frame_data, dict):
+            continue
+        try:
+            frame_idx = int(frame_key)
+        except Exception:
+            continue
+        frame_idx = max(0, frame_idx - 1)
+
+        pos = []
+        neg = []
+        for item in frame_data.get("positive_points", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pos.append((float(item["x"]), float(item["y"])))
+            except Exception:
+                continue
+        for item in frame_data.get("negative_points", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                neg.append((float(item["x"]), float(item["y"])))
+            except Exception:
+                continue
+
+        pos_rects = []
+        neg_rects = []
+        for item in frame_data.get("positive_rects", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                pos_rects.append(
+                    (
+                        float(item["x1"]),
+                        float(item["y1"]),
+                        float(item["x2"]),
+                        float(item["y2"]),
+                    )
+                )
+            except Exception:
+                continue
+        for item in frame_data.get("negative_rects", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                neg_rects.append(
+                    (
+                        float(item["x1"]),
+                        float(item["y1"]),
+                        float(item["x2"]),
+                        float(item["y2"]),
+                    )
+                )
+            except Exception:
+                continue
+
+        points = []
+        labels = []
+        for x, y in pos:
+            points.append((x, y))
+            labels.append(1)
+        for x, y in neg:
+            points.append((x, y))
+            labels.append(0)
+
+        if points or pos_rects or neg_rects:
+            schedule[int(frame_idx)] = {
+                "points": points,
+                "labels": labels,
+                "positive_rects": pos_rects,
+                "negative_rects": neg_rects,
+            }
+
+    return {"seed_frame_idx": int(seed_frame_idx), "schedule": schedule}
 
 
 def _clip_rect(rect, width, height):
@@ -1053,6 +1151,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 "negative_points_json": ("STRING", {"default": ""}),
                 "positive_rects_json": ("STRING", {"default": ""}),
                 "negative_rects_json": ("STRING", {"default": ""}),
+                "tracking_selection_json": ("STRING", {"default": "{}"}),
                 "prev_inference_state": ("SAM2INFERENCESTATE",),
                 "base_mask": ("MASK",),
             },
@@ -1078,6 +1177,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
         negative_points_json="",
         positive_rects_json="",
         negative_rects_json="",
+        tracking_selection_json="{}",
         prev_inference_state=None,
         base_mask=None,
     ):
@@ -1092,6 +1192,9 @@ class OpenShotSam2VideoSegmentationAddPoints:
         neg = _parse_points(negative_points_json)
         pos_rects = _parse_rects(positive_rects_json)
         neg_rects = _parse_rects(negative_rects_json)
+        tracking_selection = _parse_tracking_selection(tracking_selection_json)
+        prompt_schedule = dict(tracking_selection.get("schedule") or {})
+        seed_frame_idx = int(max(0, tracking_selection.get("seed_frame_idx", int(max(0, frame_index)))))
 
         if base_mask is not None:
             mask_stack = _mask_stack_like(base_mask, image) if image is not None else None
@@ -1106,14 +1209,56 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 w = int(image.shape[2])
                 pos = [(float(w) * 0.5, float(h) * 0.5)]
 
-        if (not pos) and (not pos_rects):
+        # Backward-compatible seed injection if no explicit keyframed payload exists.
+        if seed_frame_idx not in prompt_schedule and (pos or neg or pos_rects or neg_rects):
+            points = []
+            labels = []
+            for x, y in pos:
+                points.append((float(x), float(y)))
+                labels.append(1)
+            for x, y in neg:
+                points.append((float(x), float(y)))
+                labels.append(0)
+            prompt_schedule[int(seed_frame_idx)] = {
+                "points": points,
+                "labels": labels,
+                "positive_rects": list(pos_rects),
+                "negative_rects": list(neg_rects),
+            }
+
+        has_any_positive = False
+        for entry in prompt_schedule.values():
+            labels = list(entry.get("labels") or [])
+            if any(int(v) == 1 for v in labels) or bool(entry.get("positive_rects") or []):
+                has_any_positive = True
+                break
+        if not has_any_positive:
             raise ValueError("No positive points/rectangles provided")
 
-        pos_arr = np.atleast_2d(np.array(pos, dtype=np.float32)) if pos else np.empty((0, 2), dtype=np.float32)
-        neg_arr = np.atleast_2d(np.array(neg, dtype=np.float32)) if neg else np.empty((0, 2), dtype=np.float32)
+        serial_schedule = []
+        for fidx in sorted(prompt_schedule.keys()):
+            entry = prompt_schedule.get(fidx, {}) or {}
+            serial_schedule.append(
+                {
+                    "frame_idx": int(fidx),
+                    "points": [[float(p[0]), float(p[1])] for p in (entry.get("points") or [])],
+                    "labels": [int(v) for v in (entry.get("labels") or [])],
+                    "positive_rects": [[float(r[0]), float(r[1]), float(r[2]), float(r[3])] for r in (entry.get("positive_rects") or [])],
+                    "negative_rects": [[float(r[0]), float(r[1]), float(r[2]), float(r[3])] for r in (entry.get("negative_rects") or [])],
+                }
+            )
 
+        # Keep these for backward compatibility / fallback behavior.
+        first_frame = int(sorted(prompt_schedule.keys())[0])
+        first_entry = prompt_schedule.get(first_frame, {}) or {}
+        pos_seed = [tuple(p) for p, lbl in zip(first_entry.get("points") or [], first_entry.get("labels") or []) if int(lbl) == 1]
+        neg_seed = [tuple(p) for p, lbl in zip(first_entry.get("points") or [], first_entry.get("labels") or []) if int(lbl) == 0]
+        pos_arr = np.atleast_2d(np.array(pos_seed, dtype=np.float32)) if pos_seed else np.empty((0, 2), dtype=np.float32)
+        neg_arr = np.atleast_2d(np.array(neg_seed, dtype=np.float32)) if neg_seed else np.empty((0, 2), dtype=np.float32)
         coords = np.concatenate((pos_arr, neg_arr), axis=0) if (len(pos_arr) or len(neg_arr)) else np.empty((0, 2), dtype=np.float32)
         labels = np.concatenate((np.ones((len(pos_arr),), dtype=np.int32), np.zeros((len(neg_arr),), dtype=np.int32)), axis=0) if (len(pos_arr) or len(neg_arr)) else np.empty((0,), dtype=np.int32)
+        first_pos_rects = [tuple(r) for r in (first_entry.get("positive_rects") or [])]
+        first_neg_rects = [tuple(r) for r in (first_entry.get("negative_rects") or [])]
 
         # Windowed mode does not hold full-video SAM2 state in memory.
         if bool(windowed_mode):
@@ -1123,10 +1268,12 @@ class OpenShotSam2VideoSegmentationAddPoints:
             state["seed_labels"] = labels.tolist()
             state["last_points"] = coords.tolist()
             state["last_labels"] = labels.tolist()
-            state["seed_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in pos_rects]
-            state["negative_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in neg_rects]
+            state["seed_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_pos_rects]
+            state["negative_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_neg_rects]
+            state["active_negative_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_neg_rects]
+            state["prompt_schedule"] = serial_schedule
             state["object_index"] = int(object_index)
-            state["next_frame_idx"] = int(max(0, frame_index))
+            state["next_frame_idx"] = int(max(0, state.get("next_frame_idx", 0) or 0))
             state["num_frames"] = int(state.get("num_frames", 0) or 0)
             state["offload_video_to_cpu"] = bool(offload_video_to_cpu)
             state["offload_state_to_cpu"] = bool(offload_state_to_cpu)
@@ -1212,11 +1359,11 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 add_errors = _sam2_add_prompts(
                     model,
                     state,
-                    int(frame_index),
+                    int(first_frame),
                     int(object_index),
                     coords,
                     labels,
-                    pos_rects,
+                    first_pos_rects,
                 )
                 if add_errors:
                     raise RuntimeError("Failed applying one or more SAM2 rectangle prompts: {}".format(add_errors[:3]))
@@ -1235,9 +1382,12 @@ class OpenShotSam2VideoSegmentationAddPoints:
             {
                 "inference_state": state,
                 "num_frames": num_frames,
-                "next_frame_idx": int(max(0, frame_index)),
-                "negative_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in neg_rects],
-                "seed_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in pos_rects],
+                "next_frame_idx": 0,
+                "negative_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_neg_rects],
+                "active_negative_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_neg_rects],
+                "seed_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_pos_rects],
+                "prompt_schedule": serial_schedule,
+                "prompt_frames_applied": [int(first_frame)],
             },
         )
 
@@ -1324,10 +1474,66 @@ class OpenShotSam2VideoSegmentationChunked:
                 errs.append(str(ex))
         raise RuntimeError("SAM2 window init_state failed: {}".format(errs[:3]))
 
-    def _add_prompt_points(self, model, local_state, inference_state):
-        points = np.array(inference_state.get("last_points") or inference_state.get("seed_points") or [], dtype=np.float32)
-        labels = np.array(inference_state.get("last_labels") or inference_state.get("seed_labels") or [], dtype=np.int32)
-        rects = [tuple(r) for r in (inference_state.get("seed_rects") or []) if isinstance(r, (list, tuple)) and len(r) == 4]
+    def _prompt_schedule(self, inference_state):
+        raw = inference_state.get("prompt_schedule") or []
+        out = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                frame_idx = int(item.get("frame_idx", 0))
+            except Exception:
+                frame_idx = 0
+            points = []
+            for p in (item.get("points") or []):
+                if not isinstance(p, (list, tuple)) or len(p) != 2:
+                    continue
+                try:
+                    points.append((float(p[0]), float(p[1])))
+                except Exception:
+                    continue
+            labels = []
+            for v in (item.get("labels") or []):
+                try:
+                    labels.append(int(v))
+                except Exception:
+                    labels.append(0)
+            pos_rects = []
+            for r in (item.get("positive_rects") or []):
+                if not isinstance(r, (list, tuple)) or len(r) != 4:
+                    continue
+                try:
+                    pos_rects.append((float(r[0]), float(r[1]), float(r[2]), float(r[3])))
+                except Exception:
+                    continue
+            neg_rects = []
+            for r in (item.get("negative_rects") or []):
+                if not isinstance(r, (list, tuple)) or len(r) != 4:
+                    continue
+                try:
+                    neg_rects.append((float(r[0]), float(r[1]), float(r[2]), float(r[3])))
+                except Exception:
+                    continue
+            out.append(
+                {
+                    "frame_idx": int(max(0, frame_idx)),
+                    "points": points,
+                    "labels": labels,
+                    "positive_rects": pos_rects,
+                    "negative_rects": neg_rects,
+                }
+            )
+        out.sort(key=lambda x: int(x.get("frame_idx", 0)))
+        return out
+
+    def _apply_prompt_entry(self, model, state_obj, inference_state, frame_idx, entry):
+        points_list = list(entry.get("points") or [])
+        labels_list = [int(v) for v in (entry.get("labels") or [])]
+        rects = [tuple(r) for r in (entry.get("positive_rects") or [])]
+        neg_rects = [tuple(r) for r in (entry.get("negative_rects") or [])]
+
+        points = np.array(points_list, dtype=np.float32) if points_list else np.empty((0, 2), dtype=np.float32)
+        labels = np.array(labels_list, dtype=np.int32) if labels_list else np.empty((0,), dtype=np.int32)
         if points.ndim == 1 and points.size > 0:
             points = points.reshape(1, 2)
         if labels.ndim == 0 and labels.size > 0:
@@ -1336,10 +1542,50 @@ class OpenShotSam2VideoSegmentationChunked:
             centers = _rect_center_points(rects)
             points = np.array(centers, dtype=np.float32)
             labels = np.ones((len(centers),), dtype=np.int32)
-        if points.size == 0 and not rects:
-            raise ValueError("Windowed SAM2 tracker has no valid prompt points/rectangles")
+
         obj_id = int(inference_state.get("object_index", 0))
-        _sam2_add_prompts(model, local_state, 0, obj_id, points, labels, rects)
+        _sam2_add_prompts(model, state_obj, int(frame_idx), obj_id, points, labels, rects)
+        inference_state["active_negative_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in neg_rects]
+        if points.size > 0:
+            inference_state["last_points"] = points.tolist()
+            inference_state["last_labels"] = labels.tolist()
+
+    def _collect_range_masks(self, model, state_obj, frame_start, frame_count):
+        frame_start = int(max(0, frame_start))
+        frame_count = int(max(0, frame_count))
+        if frame_count <= 0:
+            return []
+        try:
+            iterator = model.propagate_in_video(
+                state_obj,
+                start_frame_idx=frame_start,
+                max_frame_num_to_track=frame_count,
+            )
+        except TypeError:
+            iterator = model.propagate_in_video(state_obj)
+
+        by_idx = {}
+        frame_end = frame_start + frame_count
+        for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+            idx = int(out_frame_idx)
+            if idx < frame_start:
+                continue
+            if idx >= frame_end:
+                break
+            combined = None
+            for i, _obj_id in enumerate(out_obj_ids):
+                current = out_mask_logits[i, 0] > 0.0
+                combined = current if combined is None else torch.logical_or(combined, current)
+            if combined is None:
+                _n, _c, h, w = out_mask_logits.shape
+                combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+            by_idx[idx] = combined.float().cpu()
+            del out_mask_logits
+        if not by_idx:
+            return []
+        h = int(next(iter(by_idx.values())).shape[0])
+        w = int(next(iter(by_idx.values())).shape[1])
+        return [by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)) for i in range(frame_start, frame_end)]
 
     def _update_prompt_from_last_mask(self, inference_state, masks):
         last = None
@@ -1374,33 +1620,53 @@ class OpenShotSam2VideoSegmentationChunked:
             with torch.inference_mode():
                 with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
                     local_state = self._init_window_state(model, window_dir, device, inference_state)
-                    self._add_prompt_points(model, local_state, inference_state)
-                    try:
-                        iterator = model.propagate_in_video(
-                            local_state,
-                            start_frame_idx=0,
-                            max_frame_num_to_track=bsz,
-                        )
-                    except TypeError:
-                        iterator = model.propagate_in_video(local_state)
-
-                    by_idx = {}
-                    for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
-                        idx = int(out_frame_idx)
-                        if idx < 0 or idx >= bsz:
+                    global_start = int(max(0, inference_state.get("next_frame_idx", 0) or 0))
+                    schedule = self._prompt_schedule(inference_state)
+                    local_events = {}
+                    for entry in schedule:
+                        gidx = int(entry.get("frame_idx", 0))
+                        if gidx < global_start or gidx >= (global_start + bsz):
                             continue
-                        combined = None
-                        for i, _obj_id in enumerate(out_obj_ids):
-                            current = out_mask_logits[i, 0] > 0.0
-                            combined = current if combined is None else torch.logical_or(combined, current)
-                        if combined is None:
-                            combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
-                        by_idx[idx] = combined.float().cpu()
-                        progress.update(1)
-                        del out_mask_logits
+                        local_events[int(gidx - global_start)] = entry
 
-            for i in range(bsz):
-                out_chunks.append(by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)))
+                    local_cursor = 0
+                    prompted = False
+                    while local_cursor < bsz:
+                        if local_cursor in local_events:
+                            self._apply_prompt_entry(model, local_state, inference_state, local_cursor, local_events[local_cursor])
+                            prompted = True
+                        if not prompted:
+                            next_keys = [k for k in local_events.keys() if int(k) > int(local_cursor)]
+                            next_prompt = min(next_keys) if next_keys else bsz
+                            gap = int(max(0, next_prompt - local_cursor))
+                            for _i in range(gap):
+                                out_chunks.append(torch.zeros((h, w), dtype=torch.float32))
+                                progress.update(1)
+                            local_cursor += gap
+                            continue
+
+                        next_keys = [k for k in local_events.keys() if int(k) > int(local_cursor)]
+                        segment_end = min(next_keys) if next_keys else bsz
+                        segment_len = int(max(1, segment_end - local_cursor))
+                        masks = self._collect_range_masks(model, local_state, local_cursor, segment_len)
+                        if not masks:
+                            masks = [torch.zeros((h, w), dtype=torch.float32) for _i in range(segment_len)]
+
+                        active_neg = [tuple(r) for r in (inference_state.get("active_negative_rects") or inference_state.get("negative_rects") or [])]
+                        if active_neg:
+                            stacked_local = torch.stack(masks, dim=0)
+                            stacked_local = _apply_negative_rects(stacked_local, active_neg)
+                            masks = [stacked_local[i] for i in range(int(stacked_local.shape[0]))]
+
+                        for m in masks:
+                            out_chunks.append(m)
+                            progress.update(1)
+                        local_cursor += segment_len
+
+            if len(out_chunks) < bsz:
+                out_chunks.extend([torch.zeros((h, w), dtype=torch.float32) for _i in range(bsz - len(out_chunks))])
+            elif len(out_chunks) > bsz:
+                out_chunks = out_chunks[:bsz]
             self._update_prompt_from_last_mask(inference_state, out_chunks)
             inference_state["next_frame_idx"] = int(inference_state.get("next_frame_idx", 0) or 0) + bsz
             inference_state["num_frames"] = int(inference_state.get("num_frames", 0) or 0) + bsz
@@ -1417,7 +1683,6 @@ class OpenShotSam2VideoSegmentationChunked:
                 mm.soft_empty_cache()
 
         stacked = torch.stack(out_chunks, dim=0)
-        stacked = _apply_negative_rects(stacked, [tuple(r) for r in (inference_state.get("negative_rects") or [])])
         return (stacked,)
 
     def segment_chunk(self, sam2_model, inference_state, image, start_frame, chunk_size_frames, keep_model_loaded, meta_batch=None):
@@ -1462,43 +1727,67 @@ class OpenShotSam2VideoSegmentationChunked:
         progress = ProgressBar(effective_chunk)
         with torch.inference_mode():
             with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-                try:
-                    iterator = model.propagate_in_video(
-                        state,
-                        start_frame_idx=current_start,
-                        max_frame_num_to_track=effective_chunk,
-                    )
-                except TypeError:
-                    iterator = model.propagate_in_video(state)
-
                 end_frame = current_start + effective_chunk
-                for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
-                    idx = int(out_frame_idx)
-                    if idx < current_start:
+                h = int(image.shape[1])
+                w = int(image.shape[2])
+                schedule_by_frame = {
+                    int(entry.get("frame_idx", 0)): entry
+                    for entry in self._prompt_schedule(inference_state)
+                }
+                applied_frames = set(int(v) for v in (inference_state.get("prompt_frames_applied") or []))
+
+                cursor = current_start
+                prompted = False
+                while cursor < end_frame:
+                    entry = schedule_by_frame.get(int(cursor))
+                    if entry is not None and int(cursor) not in applied_frames:
+                        self._apply_prompt_entry(model, state, inference_state, int(cursor), entry)
+                        applied_frames.add(int(cursor))
+                        prompted = True
+
+                    if not prompted:
+                        next_keys = [k for k in schedule_by_frame.keys() if int(k) > int(cursor)]
+                        next_prompt = min(next_keys) if next_keys else end_frame
+                        gap = int(max(0, min(next_prompt, end_frame) - cursor))
+                        for _i in range(gap):
+                            out_chunks.append(torch.zeros((h, w), dtype=torch.float32))
+                            progress.update(1)
+                        cursor += gap
                         continue
-                    if idx >= end_frame:
-                        break
 
-                    combined = None
-                    for i, _obj_id in enumerate(out_obj_ids):
-                        current = out_mask_logits[i, 0] > 0.0
-                        combined = current if combined is None else torch.logical_or(combined, current)
+                    next_keys = [k for k in schedule_by_frame.keys() if int(k) > int(cursor)]
+                    segment_end = min(next_keys) if next_keys else end_frame
+                    segment_end = int(min(segment_end, end_frame))
+                    segment_len = int(max(1, segment_end - cursor))
+                    masks = self._collect_range_masks(model, state, cursor, segment_len)
+                    if not masks:
+                        masks = [torch.zeros((h, w), dtype=torch.float32) for _i in range(segment_len)]
 
-                    if combined is None:
-                        _n, _c, h, w = out_mask_logits.shape
-                        combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+                    active_neg = [tuple(r) for r in (inference_state.get("active_negative_rects") or inference_state.get("negative_rects") or [])]
+                    if active_neg:
+                        stacked_local = torch.stack(masks, dim=0)
+                        stacked_local = _apply_negative_rects(stacked_local, active_neg)
+                        masks = [stacked_local[i] for i in range(int(stacked_local.shape[0]))]
 
-                    out_chunks.append(combined.float().cpu())
-                    progress.update(1)
-                    del out_mask_logits
+                    for m in masks:
+                        out_chunks.append(m)
+                        progress.update(1)
+                    cursor += segment_len
+                inference_state["prompt_frames_applied"] = sorted(list(applied_frames))
 
         if not out_chunks:
             raise RuntimeError(
                 "SAM2 chunk produced no frames. Check cursor/chunk size and inference state. "
                 "cursor={} chunk={} total={}".format(current_start, effective_chunk, total_frames)
             )
+        if len(out_chunks) < effective_chunk:
+            h = int(image.shape[1])
+            w = int(image.shape[2])
+            out_chunks.extend([torch.zeros((h, w), dtype=torch.float32) for _i in range(effective_chunk - len(out_chunks))])
+        elif len(out_chunks) > effective_chunk:
+            out_chunks = out_chunks[:effective_chunk]
 
-        inference_state["next_frame_idx"] = current_start + len(out_chunks)
+        inference_state["next_frame_idx"] = current_start + effective_chunk
         if total_frames > 0 and inference_state["next_frame_idx"] >= total_frames:
             if hasattr(model, "reset_state"):
                 try:
@@ -1511,7 +1800,6 @@ class OpenShotSam2VideoSegmentationChunked:
             mm.soft_empty_cache()
 
         stacked = torch.stack(out_chunks, dim=0)
-        stacked = _apply_negative_rects(stacked, [tuple(r) for r in (inference_state.get("negative_rects") or [])])
         return (stacked,)
 
 
