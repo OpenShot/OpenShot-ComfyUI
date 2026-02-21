@@ -1940,9 +1940,38 @@ class OpenShotSam2VideoSegmentationChunked:
         next_frame_idx = int(max(0, inference_state.get("next_frame_idx", 0) or 0))
         use_initial_seed = (next_frame_idx <= 0)
 
-        seed_points = inference_state.get("seed_points") if use_initial_seed else []
-        seed_labels = inference_state.get("seed_labels") if use_initial_seed else []
-        seed_rects = inference_state.get("seed_rects") if use_initial_seed else []
+        # If an explicit frame-0 prompt exists in prompt_schedule (e.g. DINO boxes),
+        # do not also inject fallback seed prompts here, to avoid duplicate/competing seeds.
+        has_initial_prompt = False
+        if use_initial_seed:
+            for entry in list(inference_state.get("prompt_schedule") or []):
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    ef = int(entry.get("frame_idx", 0))
+                except Exception:
+                    ef = 0
+                if ef != 0:
+                    continue
+                labels0 = [int(v) for v in (entry.get("labels") or [])]
+                if any(v == 1 for v in labels0) or bool(entry.get("positive_rects") or []):
+                    has_initial_prompt = True
+                    break
+                for op in list(entry.get("object_prompts") or []):
+                    if not isinstance(op, dict):
+                        continue
+                    op_labels0 = [int(v) for v in (op.get("labels") or [])]
+                    if any(v == 1 for v in op_labels0) or bool(op.get("positive_rects") or []):
+                        has_initial_prompt = True
+                        break
+                if has_initial_prompt:
+                    break
+
+        seed_points = inference_state.get("seed_points") if (use_initial_seed and not has_initial_prompt) else []
+        seed_labels = inference_state.get("seed_labels") if (use_initial_seed and not has_initial_prompt) else []
+        seed_rects = inference_state.get("seed_rects") if (use_initial_seed and not has_initial_prompt) else []
+        if use_initial_seed and has_initial_prompt:
+            _sam2_debug("seed_window_prompt-skip-fallback", "reason=frame0_prompt_schedule")
 
         points = np.array(inference_state.get("last_points") or seed_points or [], dtype=np.float32)
         labels = np.array(inference_state.get("last_labels") or seed_labels or [], dtype=np.int32)
@@ -2100,6 +2129,7 @@ class OpenShotSam2VideoSegmentationChunked:
                             iterator = model.propagate_in_video(local_state)
 
                         seen_obj_ids = set()
+                        retired_obj_ids = set()
                         for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
                             idx = int(out_frame_idx)
                             if idx < 0 or idx >= bsz:
@@ -2134,7 +2164,11 @@ class OpenShotSam2VideoSegmentationChunked:
                                         elif fill_ratio < 0.015:
                                             keep_carry = False
 
-                                        if keep_carry:
+                                        hard_retire = bool(area_ratio > 0.35 or (touches_edge and area_ratio > 0.20))
+                                        if hard_retire:
+                                            retired_obj_ids.add(obj_id_int)
+
+                                        if keep_carry and (obj_id_int not in retired_obj_ids):
                                             seen_obj_ids.add(obj_id_int)
                                             carries[str(obj_id_int)] = [
                                                 float(xs.float().mean().item()),
@@ -2147,6 +2181,7 @@ class OpenShotSam2VideoSegmentationChunked:
                                                 "area_ratio=", round(float(area_ratio), 6),
                                                 "fill_ratio=", round(float(fill_ratio), 6),
                                                 "touches_edge=", bool(touches_edge),
+                                                "hard_retire=", bool(hard_retire),
                                             )
                             if combined is None:
                                 combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
@@ -2156,11 +2191,12 @@ class OpenShotSam2VideoSegmentationChunked:
                         inference_state["object_carries"] = {
                             str(obj_id): carries.get(str(obj_id))
                             for obj_id in sorted(seen_obj_ids)
-                            if str(obj_id) in carries
+                            if (obj_id not in retired_obj_ids) and (str(obj_id) in carries)
                         }
                         _sam2_debug(
                             "segment_windowed-end",
                             "kept_carries=", sorted([int(v) for v in seen_obj_ids]),
+                            "retired_obj_ids=", sorted([int(v) for v in retired_obj_ids]),
                             "next_frame_idx=", int(inference_state.get("next_frame_idx", 0) or 0),
                         )
 
