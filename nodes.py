@@ -1678,7 +1678,8 @@ class OpenShotSam2VideoSegmentationChunked:
 
             for i in range(bsz):
                 out_chunks.append(by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)))
-            self._update_prompt_from_last_mask(inference_state, out_chunks)
+            # Do not overwrite user/keyframe prompts with a single centroid carry point.
+            # For multi-target prompts (e.g. several cars), centroid carry causes drift/fizzle.
             inference_state["next_frame_idx"] = int(inference_state.get("next_frame_idx", 0) or 0) + bsz
             inference_state["num_frames"] = int(inference_state.get("num_frames", 0) or 0) + bsz
         finally:
