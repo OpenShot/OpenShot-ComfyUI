@@ -1892,44 +1892,73 @@ class OpenShotSam2VideoSegmentationChunked:
                         applied_frames.add(gidx)
                     inference_state["prompt_frames_applied"] = sorted(list(applied_frames))
 
-                    try:
-                        iterator = model.propagate_in_video(
-                            local_state,
-                            start_frame_idx=0,
-                            max_frame_num_to_track=bsz,
-                        )
-                    except TypeError:
-                        iterator = model.propagate_in_video(local_state)
+                    def _entry_has_positive_seed(entry):
+                        labels = list((entry or {}).get("labels") or [])
+                        if any(int(v) == 1 for v in labels):
+                            return True
+                        if bool((entry or {}).get("positive_rects") or []):
+                            return True
+                        for op in list((entry or {}).get("object_prompts") or []):
+                            if not isinstance(op, dict):
+                                continue
+                            op_labels = list(op.get("labels") or [])
+                            if any(int(v) == 1 for v in op_labels) or bool(op.get("positive_rects") or []):
+                                return True
+                        return False
 
                     by_idx = {}
                     carries = dict(inference_state.get("object_carries", {}) or {})
-                    seen_obj_ids = set()
-                    for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
-                        idx = int(out_frame_idx)
-                        if idx < 0 or idx >= bsz:
+                    has_window_prompt = False
+                    for entry in self._prompt_schedule(inference_state):
+                        gidx = int(entry.get("frame_idx", 0))
+                        if gidx < global_start or gidx >= (global_start + bsz):
                             continue
-                        combined = None
-                        for i, _obj_id in enumerate(out_obj_ids):
-                            current = out_mask_logits[i, 0] > 0.0
-                            combined = current if combined is None else torch.logical_or(combined, current)
-                            if torch.any(current):
-                                ys, xs = torch.where(current)
-                                if xs.numel() > 0:
-                                    seen_obj_ids.add(int(_obj_id))
-                                    carries[str(int(_obj_id))] = [
-                                        float(xs.float().mean().item()),
-                                        float(ys.float().mean().item()),
-                                    ]
-                        if combined is None:
-                            combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
-                        by_idx[idx] = combined.float().cpu()
-                        progress.update(1)
-                        del out_mask_logits
-                    inference_state["object_carries"] = {
-                        str(obj_id): carries.get(str(obj_id))
-                        for obj_id in sorted(seen_obj_ids)
-                        if str(obj_id) in carries
-                    }
+                        if _entry_has_positive_seed(entry):
+                            has_window_prompt = True
+                            break
+
+                    # Gracefully handle prompt-only runs when detector finds no boxes.
+                    # If nothing is currently seeded, emit empty masks for this chunk.
+                    if (not carries) and (not has_window_prompt):
+                        for _ in range(bsz):
+                            progress.update(1)
+                    else:
+                        try:
+                            iterator = model.propagate_in_video(
+                                local_state,
+                                start_frame_idx=0,
+                                max_frame_num_to_track=bsz,
+                            )
+                        except TypeError:
+                            iterator = model.propagate_in_video(local_state)
+
+                        seen_obj_ids = set()
+                        for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+                            idx = int(out_frame_idx)
+                            if idx < 0 or idx >= bsz:
+                                continue
+                            combined = None
+                            for i, _obj_id in enumerate(out_obj_ids):
+                                current = out_mask_logits[i, 0] > 0.0
+                                combined = current if combined is None else torch.logical_or(combined, current)
+                                if torch.any(current):
+                                    ys, xs = torch.where(current)
+                                    if xs.numel() > 0:
+                                        seen_obj_ids.add(int(_obj_id))
+                                        carries[str(int(_obj_id))] = [
+                                            float(xs.float().mean().item()),
+                                            float(ys.float().mean().item()),
+                                        ]
+                            if combined is None:
+                                combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+                            by_idx[idx] = combined.float().cpu()
+                            progress.update(1)
+                            del out_mask_logits
+                        inference_state["object_carries"] = {
+                            str(obj_id): carries.get(str(obj_id))
+                            for obj_id in sorted(seen_obj_ids)
+                            if str(obj_id) in carries
+                        }
 
             for i in range(bsz):
                 out_chunks.append(by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)))
