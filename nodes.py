@@ -1550,6 +1550,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
             state["offload_state_to_cpu"] = bool(offload_state_to_cpu)
             state["object_carries"] = dict(state.get("object_carries", {}) or {})
             state["prompt_frames_applied"] = list(state.get("prompt_frames_applied", []) or [])
+            state["boundary_reseed_frames"] = int(max(1, state.get("boundary_reseed_frames", 4) or 4))
             if meta_batch is not None:
                 try:
                     setattr(meta_batch, "_openshot_sam2_window_state", state)
@@ -1898,7 +1899,14 @@ class OpenShotSam2VideoSegmentationChunked:
                 _sam2_add_prompts(model, state_obj, int(frame_idx), obj_id, op_points, op_labels, op_rects)
                 if op_points.size > 0:
                     carries = dict(inference_state.get("object_carries", {}) or {})
-                    carries[str(int(obj_id))] = [float(op_points[0][0]), float(op_points[0][1])]
+                    px = float(op_points[0][0])
+                    py = float(op_points[0][1])
+                    if op_rects:
+                        b = tuple(op_rects[0])
+                        bx = [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
+                    else:
+                        bx = [px - 1.0, py - 1.0, px + 1.0, py + 1.0]
+                    carries[str(int(obj_id))] = {"point": [px, py], "bbox": bx}
                     inference_state["object_carries"] = carries
         else:
             obj_id = int(inference_state.get("object_index", 0))
@@ -1917,11 +1925,18 @@ class OpenShotSam2VideoSegmentationChunked:
             "seed_rects=", len(list(inference_state.get("seed_rects") or [])),
         )
         if carries:
-            for raw_obj_id, point in carries.items():
+            for raw_obj_id, payload in carries.items():
                 try:
                     obj_id = int(raw_obj_id)
                 except Exception:
                     continue
+
+                point = payload
+                bbox = None
+                if isinstance(payload, dict):
+                    point = payload.get("point")
+                    bbox = payload.get("bbox")
+
                 if not isinstance(point, (list, tuple)) or len(point) != 2:
                     continue
                 try:
@@ -1929,9 +1944,22 @@ class OpenShotSam2VideoSegmentationChunked:
                     y = float(point[1])
                 except Exception:
                     continue
+
+                rects = []
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    try:
+                        rects = [(
+                            float(bbox[0]),
+                            float(bbox[1]),
+                            float(bbox[2]),
+                            float(bbox[3]),
+                        )]
+                    except Exception:
+                        rects = []
+
                 pts = np.array([[x, y]], dtype=np.float32)
                 lbs = np.array([1], dtype=np.int32)
-                _sam2_add_prompts(model, local_state, 0, obj_id, pts, lbs, [])
+                _sam2_add_prompts(model, local_state, 0, obj_id, pts, lbs, rects)
             return
 
         # Only apply original seed prompts on the very first chunk.
@@ -2088,6 +2116,42 @@ class OpenShotSam2VideoSegmentationChunked:
                         applied_frames.add(gidx)
                     inference_state["prompt_frames_applied"] = sorted(list(applied_frames))
 
+                    # Boundary replay: reinforce carried prompts for first N local frames.
+                    boundary_reseed_frames = int(max(1, inference_state.get("boundary_reseed_frames", 4) or 4))
+                    carries_for_reseed = dict(inference_state.get("object_carries", {}) or {})
+                    if carries_for_reseed and boundary_reseed_frames > 1:
+                        max_local = int(min(bsz, boundary_reseed_frames))
+                        for local_f in range(1, max_local):
+                            for raw_obj_id, payload in carries_for_reseed.items():
+                                try:
+                                    obj_id = int(raw_obj_id)
+                                except Exception:
+                                    continue
+                                point = payload
+                                bbox = None
+                                if isinstance(payload, dict):
+                                    point = payload.get("point")
+                                    bbox = payload.get("bbox")
+                                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                                    continue
+                                try:
+                                    x = float(point[0])
+                                    y = float(point[1])
+                                except Exception:
+                                    continue
+                                rects = []
+                                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                                    try:
+                                        rects = [(
+                                            float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                                        )]
+                                    except Exception:
+                                        rects = []
+                                pts = np.array([[x, y]], dtype=np.float32)
+                                lbs = np.array([1], dtype=np.int32)
+                                _sam2_add_prompts(model, local_state, int(local_f), obj_id, pts, lbs, rects)
+                        _sam2_debug("boundary_reseed", "frames=", int(max_local), "objects=", len(carries_for_reseed))
+
                     def _entry_has_positive_seed(entry):
                         labels = list((entry or {}).get("labels") or [])
                         if any(int(v) == 1 for v in labels):
@@ -2129,7 +2193,6 @@ class OpenShotSam2VideoSegmentationChunked:
                             iterator = model.propagate_in_video(local_state)
 
                         seen_obj_ids = set()
-                        retired_obj_ids = set()
                         for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
                             idx = int(out_frame_idx)
                             if idx < 0 or idx >= bsz:
@@ -2142,47 +2205,20 @@ class OpenShotSam2VideoSegmentationChunked:
                                     ys, xs = torch.where(current)
                                     if xs.numel() > 0:
                                         obj_id_int = int(_obj_id)
-                                        area = int(xs.numel())
-                                        area_ratio = float(area) / float(max(1, h * w))
                                         min_x = int(xs.min().item())
                                         max_x = int(xs.max().item())
                                         min_y = int(ys.min().item())
                                         max_y = int(ys.max().item())
-                                        bbox_w = int(max_x - min_x + 1)
-                                        bbox_h = int(max_y - min_y + 1)
-                                        bbox_area = max(1, bbox_w * bbox_h)
-                                        fill_ratio = float(area) / float(bbox_area)
-                                        touches_edge = (min_x <= 1) or (min_y <= 1) or (max_x >= (w - 2)) or (max_y >= (h - 2))
-
-                                        keep_carry = True
-                                        if area_ratio < 0.0002:
-                                            keep_carry = False
-                                        elif area_ratio > 0.35:
-                                            keep_carry = False
-                                        elif touches_edge and area_ratio < 0.003:
-                                            keep_carry = False
-                                        elif fill_ratio < 0.015:
-                                            keep_carry = False
-
-                                        hard_retire = bool(area_ratio > 0.35 or (touches_edge and area_ratio > 0.20))
-                                        if hard_retire:
-                                            retired_obj_ids.add(obj_id_int)
-
-                                        if keep_carry and (obj_id_int not in retired_obj_ids):
-                                            seen_obj_ids.add(obj_id_int)
-                                            carries[str(obj_id_int)] = [
+                                        seen_obj_ids.add(obj_id_int)
+                                        carries[str(obj_id_int)] = {
+                                            "point": [
                                                 float(xs.float().mean().item()),
                                                 float(ys.float().mean().item()),
-                                            ]
-                                        else:
-                                            _sam2_debug(
-                                                "carry-drop-windowed",
-                                                "obj_id=", int(obj_id_int),
-                                                "area_ratio=", round(float(area_ratio), 6),
-                                                "fill_ratio=", round(float(fill_ratio), 6),
-                                                "touches_edge=", bool(touches_edge),
-                                                "hard_retire=", bool(hard_retire),
-                                            )
+                                            ],
+                                            "bbox": [
+                                                float(min_x), float(min_y), float(max_x), float(max_y),
+                                            ],
+                                        }
                             if combined is None:
                                 combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
                             by_idx[idx] = combined.float().cpu()
@@ -2191,12 +2227,11 @@ class OpenShotSam2VideoSegmentationChunked:
                         inference_state["object_carries"] = {
                             str(obj_id): carries.get(str(obj_id))
                             for obj_id in sorted(seen_obj_ids)
-                            if (obj_id not in retired_obj_ids) and (str(obj_id) in carries)
+                            if str(obj_id) in carries
                         }
                         _sam2_debug(
                             "segment_windowed-end",
                             "kept_carries=", sorted([int(v) for v in seen_obj_ids]),
-                            "retired_obj_ids=", sorted([int(v) for v in retired_obj_ids]),
                             "next_frame_idx=", int(inference_state.get("next_frame_idx", 0) or 0),
                         )
 
@@ -2323,22 +2358,16 @@ class OpenShotSam2VideoSegmentationChunked:
                                 fill_ratio = float(area) / float(bbox_area)
                                 touches_edge = (min_x <= 1) or (min_y <= 1) or (max_x >= (w_cur - 2)) or (max_y >= (h_cur - 2))
 
-                                keep_carry = True
-                                if area_ratio < 0.0002:
-                                    keep_carry = False
-                                elif area_ratio > 0.35:
-                                    keep_carry = False
-                                elif touches_edge and area_ratio < 0.003:
-                                    keep_carry = False
-                                elif fill_ratio < 0.015:
-                                    keep_carry = False
-
-                                if keep_carry:
-                                    seen_obj_ids.add(obj_id_int)
-                                    carries[str(obj_id_int)] = [
+                                seen_obj_ids.add(obj_id_int)
+                                carries[str(obj_id_int)] = {
+                                    "point": [
                                         float(xs.float().mean().item()),
                                         float(ys.float().mean().item()),
-                                    ]
+                                    ],
+                                    "bbox": [
+                                        float(min_x), float(min_y), float(max_x), float(max_y),
+                                    ],
+                                }
 
                     if combined is None:
                         _n, _c, h, w = out_mask_logits.shape
