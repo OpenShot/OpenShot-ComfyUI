@@ -1972,7 +1972,7 @@ class OpenShotSam2VideoSegmentationChunked:
         inference_state["last_points"] = [[cx, cy]]
         inference_state["last_labels"] = [1]
 
-    def _segment_windowed(self, sam2_model, inference_state, image, keep_model_loaded):
+    def _segment_windowed(self, sam2_model, inference_state, image, keep_model_loaded, meta_batch=None):
         model = sam2_model["model"]
         device = sam2_model["device"]
         dtype = sam2_model["dtype"]
@@ -2131,7 +2131,7 @@ class OpenShotSam2VideoSegmentationChunked:
             raise ValueError("Loaded SAM2 model is not configured for video")
 
         if bool(inference_state.get("windowed_mode", False)):
-            return self._segment_windowed(sam2_model, inference_state, image, keep_model_loaded)
+            return self._segment_windowed(sam2_model, inference_state, image, keep_model_loaded, meta_batch=meta_batch)
 
         state = inference_state["inference_state"]
         chunk_size_frames = int(max(1, chunk_size_frames))
