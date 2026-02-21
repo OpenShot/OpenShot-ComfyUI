@@ -1390,13 +1390,42 @@ class OpenShotSam2VideoSegmentationAddPoints:
         prompt_schedule = dict(tracking_selection.get("schedule") or {})
         seed_frame_idx = int(max(0, tracking_selection.get("seed_frame_idx", int(max(0, frame_index)))))
 
-        # In windowed meta-batch mode, reuse evolving state between chunks so
-        # prompts are not re-seeded from frame 1 on each batch.
+        # Build a stable run key so cached meta-batch state is reused only for
+        # the same source/prompt/seed inputs within one generation.
+        run_key_payload = {
+            "video_path": str(video_path or ""),
+            "frame_index": int(max(0, frame_index)),
+            "seed_frame_idx": int(seed_frame_idx),
+            "object_index": int(max(0, object_index)),
+            "auto_mode": bool(auto_mode),
+            "dino_prompt": str(dino_prompt or "").strip(),
+            "dino_model_id": str(dino_model_id or ""),
+            "dino_box_threshold": float(dino_box_threshold),
+            "dino_text_threshold": float(dino_text_threshold),
+            "positive_points_json": str(positive_points_json or ""),
+            "negative_points_json": str(negative_points_json or ""),
+            "positive_rects_json": str(positive_rects_json or ""),
+            "negative_rects_json": str(negative_rects_json or ""),
+            "tracking_selection_json": str(tracking_selection_json or "{}"),
+        }
+        meta_run_key = hashlib.sha256(json.dumps(run_key_payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+        # In windowed meta-batch mode, reuse evolving state between chunks only
+        # when the request matches this exact run key.
         if bool(windowed_mode) and prev_inference_state is None and meta_batch is not None:
             try:
                 cached_state = getattr(meta_batch, "_openshot_sam2_window_state", None)
                 if isinstance(cached_state, dict) and cached_state.get("windowed_mode", False):
-                    return (sam2_model, cached_state)
+                    cached_key = str(cached_state.get("_meta_run_key", ""))
+                    if cached_key and cached_key == meta_run_key:
+                        _sam2_debug("meta-cache", "reuse=1", "run_key=", cached_key[:10])
+                        return (sam2_model, cached_state)
+                    # Different run: drop stale cache so prompts are rebuilt.
+                    _sam2_debug("meta-cache", "reuse=0", "reason=run_key_mismatch")
+                    try:
+                        setattr(meta_batch, "_openshot_sam2_window_state", None)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -1587,6 +1616,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
             state["object_carries"] = dict(state.get("object_carries", {}) or {})
             state["prompt_frames_applied"] = list(state.get("prompt_frames_applied", []) or [])
             state["boundary_reseed_frames"] = int(max(1, state.get("boundary_reseed_frames", 4) or 4))
+            state["_meta_run_key"] = str(meta_run_key)
             if meta_batch is not None:
                 try:
                     setattr(meta_batch, "_openshot_sam2_window_state", state)
@@ -2277,6 +2307,8 @@ class OpenShotSam2VideoSegmentationChunked:
             # For multi-target prompts (e.g. several cars), centroid carry causes drift/fizzle.
             inference_state["next_frame_idx"] = int(inference_state.get("next_frame_idx", 0) or 0) + bsz
             inference_state["num_frames"] = int(inference_state.get("num_frames", 0) or 0) + bsz
+            if "_meta_run_key" not in inference_state:
+                inference_state["_meta_run_key"] = ""
             if meta_batch is not None:
                 try:
                     setattr(meta_batch, "_openshot_sam2_window_state", inference_state)
