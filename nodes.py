@@ -4,6 +4,7 @@ import hashlib
 import subprocess
 import shutil
 import time
+import tempfile
 from contextlib import nullcontext
 from urllib.parse import urlparse
 from fractions import Fraction
@@ -660,6 +661,45 @@ def _ensure_mp4_for_sam2(video_path):
     return out_path
 
 
+def _load_video_frame_tensor_for_dino(video_path, frame_index=0):
+    """Load one RGB frame from video as IMAGE tensor shape [1,H,W,C] in 0..1."""
+    vp = _resolve_video_path_for_sam2(video_path)
+    vp = _ensure_mp4_for_sam2(vp)
+    if not vp or (not os.path.isfile(vp)):
+        return None
+
+    try:
+        frame_index = int(max(0, frame_index))
+    except Exception:
+        frame_index = 0
+
+    tmp_dir = tempfile.mkdtemp(prefix="openshot_dino_frame_", dir=folder_paths.get_temp_directory())
+    out_png = os.path.join(tmp_dir, "seed.png")
+    filter_expr = r"select=eq(n\,{})".format(frame_index)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        vp,
+        "-vf",
+        filter_expr,
+        "-vframes",
+        "1",
+        out_png,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if not os.path.isfile(out_png):
+            return None
+        pil = Image.open(out_png).convert("RGB")
+        arr = np.asarray(pil, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).unsqueeze(0)
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _build_sam2_video_predictor(config_name, checkpoint, torch_device):
     """Build a SAM2 video predictor across package variants."""
     if sam2_build is None:
@@ -1299,30 +1339,44 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 pos = [(float(w) * 0.5, float(h) * 0.5)]
 
         dino_prompt = str(dino_prompt or "").strip()
-        if dino_prompt and image is not None:
-            try:
-                dino_boxes = _detect_groundingdino_boxes(
-                    image,
-                    dino_prompt,
-                    dino_model_id,
-                    float(dino_box_threshold),
-                    float(dino_text_threshold),
-                    dino_device,
-                )
-                print(
-                    "[OpenShot-ComfyUI:{}] DINO prompt='{}' boxes={} model='{}' box_th={} text_th={}".format(
-                        OPENSHOT_NODEPACK_VERSION,
+        if dino_prompt:
+            dino_image = image
+            if dino_image is None and str(video_path or "").strip():
+                dino_image = _load_video_frame_tensor_for_dino(video_path, seed_frame_idx)
+
+            if dino_image is not None:
+                try:
+                    dino_boxes = _detect_groundingdino_boxes(
+                        dino_image,
                         dino_prompt,
-                        len(dino_boxes),
                         dino_model_id,
                         float(dino_box_threshold),
                         float(dino_text_threshold),
+                        dino_device,
+                    )
+                    print(
+                        "[OpenShot-ComfyUI:{}] DINO prompt='{}' boxes={} model='{}' box_th={} text_th={}".format(
+                            OPENSHOT_NODEPACK_VERSION,
+                            dino_prompt,
+                            len(dino_boxes),
+                            dino_model_id,
+                            float(dino_box_threshold),
+                            float(dino_text_threshold),
+                        )
+                    )
+                except Exception as ex:
+                    raise RuntimeError(
+                        "GroundingDINO detection failed for prompt '{}': {}".format(dino_prompt, ex)
+                    )
+            else:
+                dino_boxes = []
+                print(
+                    "[OpenShot-ComfyUI:{}] DINO prompt='{}' skipped (no image or video_path frame available)".format(
+                        OPENSHOT_NODEPACK_VERSION,
+                        dino_prompt,
                     )
                 )
-            except Exception as ex:
-                raise RuntimeError(
-                    "GroundingDINO detection failed for prompt '{}': {}".format(dino_prompt, ex)
-                )
+
             if dino_boxes:
                 seed_entry = dict(prompt_schedule.get(seed_frame_idx, {}) or {})
                 seed_object_prompts = list(seed_entry.get("object_prompts") or [])
