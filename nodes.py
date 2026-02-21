@@ -1356,10 +1356,13 @@ class OpenShotSam2VideoSegmentationAddPoints:
         has_any_positive = False
         for entry in prompt_schedule.values():
             labels = list(entry.get("labels") or [])
-            if any(int(v) == 1 for v in labels) or bool(entry.get("positive_rects") or []):
+            object_prompts = list(entry.get("object_prompts") or [])
+            has_object_positive = any(bool((op or {}).get("positive_rects") or []) for op in object_prompts if isinstance(op, dict))
+            if any(int(v) == 1 for v in labels) or bool(entry.get("positive_rects") or []) or has_object_positive:
                 has_any_positive = True
                 break
-        if not has_any_positive:
+        allow_empty_schedule = bool(dino_prompt) or bool(auto_mode)
+        if not has_any_positive and not allow_empty_schedule:
             raise ValueError("No positive points/rectangles provided")
 
         serial_schedule = []
@@ -1389,8 +1392,12 @@ class OpenShotSam2VideoSegmentationAddPoints:
             )
 
         # Keep these for backward compatibility / fallback behavior.
-        first_frame = int(sorted(prompt_schedule.keys())[0])
-        first_entry = prompt_schedule.get(first_frame, {}) or {}
+        if prompt_schedule:
+            first_frame = int(sorted(prompt_schedule.keys())[0])
+            first_entry = prompt_schedule.get(first_frame, {}) or {}
+        else:
+            first_frame = int(seed_frame_idx)
+            first_entry = {}
         pos_seed = [tuple(p) for p, lbl in zip(first_entry.get("points") or [], first_entry.get("labels") or []) if int(lbl) == 1]
         neg_seed = [tuple(p) for p, lbl in zip(first_entry.get("points") or [], first_entry.get("labels") or []) if int(lbl) == 0]
         pos_arr = np.atleast_2d(np.array(pos_seed, dtype=np.float32)) if pos_seed else np.empty((0, 2), dtype=np.float32)
@@ -1498,15 +1505,17 @@ class OpenShotSam2VideoSegmentationAddPoints:
         autocast_ok = not mm.is_device_mps(device)
         with torch.inference_mode():
             with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-                add_errors = _sam2_add_prompts(
-                    model,
-                    state,
-                    int(first_frame),
-                    int(object_index),
-                    coords,
-                    labels,
-                    first_pos_rects,
-                )
+                add_errors = []
+                if len(coords) or len(first_pos_rects):
+                    add_errors = _sam2_add_prompts(
+                        model,
+                        state,
+                        int(first_frame),
+                        int(object_index),
+                        coords,
+                        labels,
+                        first_pos_rects,
+                    )
                 if add_errors:
                     raise RuntimeError("Failed applying one or more SAM2 rectangle prompts: {}".format(add_errors[:3]))
 
@@ -1529,7 +1538,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 "active_negative_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_neg_rects],
                 "seed_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in first_pos_rects],
                 "prompt_schedule": serial_schedule,
-                "prompt_frames_applied": [int(first_frame)],
+                "prompt_frames_applied": [int(first_frame)] if (len(coords) or len(first_pos_rects)) else [],
                 "object_carries": {},
             },
         )
