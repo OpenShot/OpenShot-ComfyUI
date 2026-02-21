@@ -41,6 +41,14 @@ except Exception as ex:  # pragma: no cover - runtime env specific
 else:
     _groundingdino_import_error = None
 
+try:
+    from transnetv2_pytorch import TransNetV2 as _TransNetV2
+except Exception as ex:  # pragma: no cover - runtime env specific
+    _TransNetV2 = None
+    _transnet_import_error = ex
+else:
+    _transnet_import_error = None
+
 
 SAM2_MODEL_DIR = "sam2"
 OPENSHOT_NODEPACK_VERSION = "v1.0.4-masked-blur-skip-empty"
@@ -80,6 +88,15 @@ def _require_groundingdino():
         raise RuntimeError(
             "GroundingDINO imports failed. Install requirements and restart ComfyUI. Error: {}".format(
                 _groundingdino_import_error
+            )
+        )
+
+
+def _require_transnet():
+    if _TransNetV2 is None:
+        raise RuntimeError(
+            "TransNetV2 imports failed. Install `transnetv2-pytorch` and restart ComfyUI. Error: {}".format(
+                _transnet_import_error
             )
         )
 
@@ -347,6 +364,156 @@ def _build_sam2_video_predictor(config_name, checkpoint, torch_device):
     raise RuntimeError(
         "Could not build SAM2 video predictor. Found builders={} last_error={}".format(found, last_error)
     )
+
+
+class OpenShotTransNetSceneDetect:
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return ""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_video_path": ("STRING", {"default": ""}),
+                "threshold": ("FLOAT", {"default": 0.50, "min": 0.01, "max": 0.99, "step": 0.01}),
+                "min_scene_length_frames": ("INT", {"default": 30, "min": 1, "max": 10000}),
+                "device": (["auto", "cuda", "cpu", "mps"], {"default": "auto"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("scene_ranges_json",)
+    FUNCTION = "detect"
+    CATEGORY = "OpenShot/Video"
+
+    def _resolve_device_name(self, device_name):
+        value = str(device_name or "auto").strip().lower()
+        if value != "auto":
+            return value
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def _build_model(self, device_name):
+        errors = []
+        for kwargs in (
+            {"device": device_name},
+            {},
+        ):
+            try:
+                return _TransNetV2(**kwargs)
+            except Exception as ex:
+                errors.append(str(ex))
+        raise RuntimeError("Failed to initialize TransNetV2 model: {}".format(errors[:2]))
+
+    def _extract_scenes(self, raw):
+        fps = None
+        scenes = None
+
+        if isinstance(raw, dict):
+            scenes = raw.get("scenes")
+            fps_value = raw.get("fps")
+            try:
+                if fps_value is not None:
+                    fps = float(fps_value)
+            except Exception:
+                fps = None
+        else:
+            scenes = raw
+
+        normalized = []
+        if isinstance(scenes, np.ndarray):
+            scenes = scenes.tolist()
+
+        if isinstance(scenes, list):
+            for entry in scenes:
+                start = end = None
+                if isinstance(entry, dict):
+                    start = entry.get("start_seconds", entry.get("start_time", entry.get("start")))
+                    end = entry.get("end_seconds", entry.get("end_time", entry.get("end")))
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    start, end = entry[0], entry[1]
+                try:
+                    start_f = float(start)
+                    end_f = float(end)
+                except Exception:
+                    continue
+                if end_f <= start_f:
+                    continue
+                normalized.append((start_f, end_f))
+        return normalized, fps
+
+    def _run_inference(self, model, video_path, threshold):
+        errors = []
+        for fn_name in ("detect_scenes", "analyze_video", "predict_video"):
+            fn = getattr(model, fn_name, None)
+            if not callable(fn):
+                continue
+            for kwargs in (
+                {"threshold": float(threshold)},
+                {},
+            ):
+                try:
+                    return fn(video_path, **kwargs)
+                except TypeError:
+                    continue
+                except Exception as ex:
+                    errors.append("{}: {}".format(fn_name, ex))
+                    break
+        raise RuntimeError("TransNetV2 inference failed: {}".format(errors[:2]))
+
+    def _apply_min_scene_length(self, scenes, fps, min_scene_length_frames):
+        if not scenes:
+            return []
+        if not fps or fps <= 0:
+            return scenes
+        min_seconds = float(min_scene_length_frames) / float(fps)
+        if min_seconds <= 0:
+            return scenes
+
+        out = []
+        for start_sec, end_sec in scenes:
+            if not out:
+                out.append([start_sec, end_sec])
+                continue
+            duration = end_sec - start_sec
+            if duration < min_seconds:
+                out[-1][1] = max(out[-1][1], end_sec)
+                continue
+            out.append([start_sec, end_sec])
+        return [(float(s), float(e)) for s, e in out if e > s]
+
+    def detect(self, source_video_path, threshold, min_scene_length_frames, device):
+        _require_transnet()
+        video_path = _resolve_video_path_for_sam2(source_video_path)
+        if not video_path or not os.path.exists(video_path):
+            raise ValueError("Video path not found: {}".format(source_video_path))
+
+        device_name = self._resolve_device_name(device)
+        model = self._build_model(device_name)
+        raw = self._run_inference(model, video_path, threshold)
+        scenes, fps = self._extract_scenes(raw)
+        scenes = sorted(scenes, key=lambda item: (item[0], item[1]))
+        scenes = self._apply_min_scene_length(scenes, fps, int(min_scene_length_frames))
+
+        payload = {
+            "version": 1,
+            "detector": "openshot-transnetv2",
+            "source_video_path": str(video_path),
+            "fps": float(fps) if fps else None,
+            "segments": [
+                {
+                    "index": idx,
+                    "start_seconds": round(float(start_sec), 6),
+                    "end_seconds": round(float(end_sec), 6),
+                }
+                for idx, (start_sec, end_sec) in enumerate(scenes, start=1)
+            ],
+        }
+        return (json.dumps(payload),)
 
 
 def _probe_video_info(path_text):
@@ -1346,6 +1513,7 @@ class OpenShotGroundingDinoDetect:
 
 
 NODE_CLASS_MAPPINGS = {
+    "OpenShotTransNetSceneDetect": OpenShotTransNetSceneDetect,
     "OpenShotDownloadAndLoadSAM2Model": OpenShotDownloadAndLoadSAM2Model,
     "OpenShotSam2Segmentation": OpenShotSam2Segmentation,
     "OpenShotSam2VideoSegmentationAddPoints": OpenShotSam2VideoSegmentationAddPoints,
@@ -1356,6 +1524,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "OpenShotTransNetSceneDetect": "OpenShot TransNet Scene Detect",
     "OpenShotDownloadAndLoadSAM2Model": "OpenShot Download+Load SAM2",
     "OpenShotSam2Segmentation": "OpenShot SAM2 Segmentation (Image)",
     "OpenShotSam2VideoSegmentationAddPoints": "OpenShot SAM2 Add Video Points",

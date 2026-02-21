@@ -11,6 +11,7 @@ This V1 intentionally stays close to standard ComfyUI primitives and types while
 - `OpenShotSam2VideoSegmentationAddPoints`
 - `OpenShotSam2VideoSegmentationChunked` (meta-batch/chunk friendly)
 - `OpenShotGroundingDinoDetect` (text-prompted object detection -> mask + JSON)
+- `OpenShotTransNetSceneDetect` (direct TransNetV2 inference -> IN/OUT JSON ranges)
 
 ## Why this exists
 
@@ -32,6 +33,7 @@ Please see upstream projects for full original implementations and credits.
 - `decord` (required by many SAM2 video predictor builds)
 - `sam2` Python package/module available in your Comfy runtime
 - GroundingDINO runtime via Hugging Face Transformers (installed from `requirements.txt`)
+- `transnetv2-pytorch` (installed from `requirements.txt`)
 
 Install this node pack into `ComfyUI/custom_nodes/OpenShot-ComfyUI` and restart ComfyUI.
 
@@ -50,6 +52,10 @@ Ensure your Comfy environment already has a compatible `sam2` installed.
 ### GroundingDINO model downloads
 
 `OpenShotGroundingDinoDetect` will download selected model weights from Hugging Face on first use and cache them in your HF cache directory.
+
+### TransNet scene detection behavior
+
+`OpenShotTransNetSceneDetect` runs TransNetV2 inference directly and returns scene range JSON (`start_seconds`, `end_seconds`), so no external TransNet Comfy node pack is required.
 
 ## Models
 
