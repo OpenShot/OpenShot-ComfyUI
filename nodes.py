@@ -1174,6 +1174,7 @@ class OpenShotSam2Segmentation:
                 "positive_rects_json": ("STRING", {"default": ""}),
                 "negative_rects_json": ("STRING", {"default": ""}),
                 "base_mask": ("MASK",),
+                "meta_batch": ("VHS_BatchManager",),
             },
         }
 
@@ -1328,6 +1329,7 @@ class OpenShotSam2VideoSegmentationAddPoints:
         dino_device="auto",
         prev_inference_state=None,
         base_mask=None,
+        meta_batch=None,
     ):
         model = sam2_model["model"]
         device = sam2_model["device"]
@@ -1343,6 +1345,16 @@ class OpenShotSam2VideoSegmentationAddPoints:
         tracking_selection = _parse_tracking_selection(tracking_selection_json)
         prompt_schedule = dict(tracking_selection.get("schedule") or {})
         seed_frame_idx = int(max(0, tracking_selection.get("seed_frame_idx", int(max(0, frame_index)))))
+
+        # In windowed meta-batch mode, reuse evolving state between chunks so
+        # prompts are not re-seeded from frame 1 on each batch.
+        if bool(windowed_mode) and prev_inference_state is None and meta_batch is not None:
+            try:
+                cached_state = getattr(meta_batch, "_openshot_sam2_window_state", None)
+                if isinstance(cached_state, dict) and cached_state.get("windowed_mode", False):
+                    return (sam2_model, cached_state)
+            except Exception:
+                pass
 
         if base_mask is not None:
             mask_stack = _mask_stack_like(base_mask, image) if image is not None else None
@@ -1511,6 +1523,11 @@ class OpenShotSam2VideoSegmentationAddPoints:
             state["offload_state_to_cpu"] = bool(offload_state_to_cpu)
             state["object_carries"] = dict(state.get("object_carries", {}) or {})
             state["prompt_frames_applied"] = list(state.get("prompt_frames_applied", []) or [])
+            if meta_batch is not None:
+                try:
+                    setattr(meta_batch, "_openshot_sam2_window_state", state)
+                except Exception:
+                    pass
             return (sam2_model, state)
 
         if (image is None and not str(video_path or "").strip()) and prev_inference_state is None:
@@ -2085,6 +2102,11 @@ class OpenShotSam2VideoSegmentationChunked:
             # For multi-target prompts (e.g. several cars), centroid carry causes drift/fizzle.
             inference_state["next_frame_idx"] = int(inference_state.get("next_frame_idx", 0) or 0) + bsz
             inference_state["num_frames"] = int(inference_state.get("num_frames", 0) or 0) + bsz
+            if meta_batch is not None:
+                try:
+                    setattr(meta_batch, "_openshot_sam2_window_state", inference_state)
+                except Exception:
+                    pass
         finally:
             if local_state is not None and hasattr(model, "reset_state"):
                 try:
