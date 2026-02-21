@@ -1550,6 +1550,23 @@ class OpenShotSam2VideoSegmentationChunked:
             inference_state["last_points"] = points.tolist()
             inference_state["last_labels"] = labels.tolist()
 
+    def _seed_window_prompt(self, model, local_state, inference_state):
+        points = np.array(inference_state.get("last_points") or inference_state.get("seed_points") or [], dtype=np.float32)
+        labels = np.array(inference_state.get("last_labels") or inference_state.get("seed_labels") or [], dtype=np.int32)
+        rects = [tuple(r) for r in (inference_state.get("seed_rects") or []) if isinstance(r, (list, tuple)) and len(r) == 4]
+        if points.ndim == 1 and points.size > 0:
+            points = points.reshape(1, 2)
+        if labels.ndim == 0 and labels.size > 0:
+            labels = labels.reshape(1)
+        if (points.size == 0 or labels.size == 0) and rects:
+            centers = _rect_center_points(rects)
+            points = np.array(centers, dtype=np.float32)
+            labels = np.ones((len(centers),), dtype=np.int32)
+        if points.size == 0 and not rects:
+            return
+        obj_id = int(inference_state.get("object_index", 0))
+        _sam2_add_prompts(model, local_state, 0, obj_id, points, labels, rects)
+
     def _collect_range_masks(self, model, state_obj, frame_start, frame_count):
         frame_start = int(max(0, frame_start))
         frame_count = int(max(0, frame_count))
@@ -1620,53 +1637,47 @@ class OpenShotSam2VideoSegmentationChunked:
             with torch.inference_mode():
                 with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
                     local_state = self._init_window_state(model, window_dir, device, inference_state)
+                    # Seed from carried prompt so chunk-to-chunk tracking continues.
+                    self._seed_window_prompt(model, local_state, inference_state)
+
                     global_start = int(max(0, inference_state.get("next_frame_idx", 0) or 0))
-                    schedule = self._prompt_schedule(inference_state)
-                    local_events = {}
-                    for entry in schedule:
+                    applied_frames = set(int(v) for v in (inference_state.get("prompt_frames_applied") or []))
+                    for entry in self._prompt_schedule(inference_state):
                         gidx = int(entry.get("frame_idx", 0))
                         if gidx < global_start or gidx >= (global_start + bsz):
                             continue
-                        local_events[int(gidx - global_start)] = entry
-
-                    local_cursor = 0
-                    prompted = False
-                    while local_cursor < bsz:
-                        if local_cursor in local_events:
-                            self._apply_prompt_entry(model, local_state, inference_state, local_cursor, local_events[local_cursor])
-                            prompted = True
-                        if not prompted:
-                            next_keys = [k for k in local_events.keys() if int(k) > int(local_cursor)]
-                            next_prompt = min(next_keys) if next_keys else bsz
-                            gap = int(max(0, next_prompt - local_cursor))
-                            for _i in range(gap):
-                                out_chunks.append(torch.zeros((h, w), dtype=torch.float32))
-                                progress.update(1)
-                            local_cursor += gap
+                        if gidx in applied_frames:
                             continue
+                        self._apply_prompt_entry(model, local_state, inference_state, int(gidx - global_start), entry)
+                        applied_frames.add(gidx)
+                    inference_state["prompt_frames_applied"] = sorted(list(applied_frames))
 
-                        next_keys = [k for k in local_events.keys() if int(k) > int(local_cursor)]
-                        segment_end = min(next_keys) if next_keys else bsz
-                        segment_len = int(max(1, segment_end - local_cursor))
-                        masks = self._collect_range_masks(model, local_state, local_cursor, segment_len)
-                        if not masks:
-                            masks = [torch.zeros((h, w), dtype=torch.float32) for _i in range(segment_len)]
+                    try:
+                        iterator = model.propagate_in_video(
+                            local_state,
+                            start_frame_idx=0,
+                            max_frame_num_to_track=bsz,
+                        )
+                    except TypeError:
+                        iterator = model.propagate_in_video(local_state)
 
-                        active_neg = [tuple(r) for r in (inference_state.get("active_negative_rects") or inference_state.get("negative_rects") or [])]
-                        if active_neg:
-                            stacked_local = torch.stack(masks, dim=0)
-                            stacked_local = _apply_negative_rects(stacked_local, active_neg)
-                            masks = [stacked_local[i] for i in range(int(stacked_local.shape[0]))]
+                    by_idx = {}
+                    for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+                        idx = int(out_frame_idx)
+                        if idx < 0 or idx >= bsz:
+                            continue
+                        combined = None
+                        for i, _obj_id in enumerate(out_obj_ids):
+                            current = out_mask_logits[i, 0] > 0.0
+                            combined = current if combined is None else torch.logical_or(combined, current)
+                        if combined is None:
+                            combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+                        by_idx[idx] = combined.float().cpu()
+                        progress.update(1)
+                        del out_mask_logits
 
-                        for m in masks:
-                            out_chunks.append(m)
-                            progress.update(1)
-                        local_cursor += segment_len
-
-            if len(out_chunks) < bsz:
-                out_chunks.extend([torch.zeros((h, w), dtype=torch.float32) for _i in range(bsz - len(out_chunks))])
-            elif len(out_chunks) > bsz:
-                out_chunks = out_chunks[:bsz]
+            for i in range(bsz):
+                out_chunks.append(by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)))
             self._update_prompt_from_last_mask(inference_state, out_chunks)
             inference_state["next_frame_idx"] = int(inference_state.get("next_frame_idx", 0) or 0) + bsz
             inference_state["num_frames"] = int(inference_state.get("num_frames", 0) or 0) + bsz
@@ -1728,64 +1739,54 @@ class OpenShotSam2VideoSegmentationChunked:
         with torch.inference_mode():
             with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
                 end_frame = current_start + effective_chunk
-                h = int(image.shape[1])
-                w = int(image.shape[2])
                 schedule_by_frame = {
                     int(entry.get("frame_idx", 0)): entry
                     for entry in self._prompt_schedule(inference_state)
                 }
                 applied_frames = set(int(v) for v in (inference_state.get("prompt_frames_applied") or []))
-
-                cursor = current_start
-                prompted = False
-                while cursor < end_frame:
-                    entry = schedule_by_frame.get(int(cursor))
-                    if entry is not None and int(cursor) not in applied_frames:
-                        self._apply_prompt_entry(model, state, inference_state, int(cursor), entry)
-                        applied_frames.add(int(cursor))
-                        prompted = True
-
-                    if not prompted:
-                        next_keys = [k for k in schedule_by_frame.keys() if int(k) > int(cursor)]
-                        next_prompt = min(next_keys) if next_keys else end_frame
-                        gap = int(max(0, min(next_prompt, end_frame) - cursor))
-                        for _i in range(gap):
-                            out_chunks.append(torch.zeros((h, w), dtype=torch.float32))
-                            progress.update(1)
-                        cursor += gap
+                for frame_idx in sorted(schedule_by_frame.keys()):
+                    if frame_idx < current_start or frame_idx >= end_frame:
                         continue
-
-                    next_keys = [k for k in schedule_by_frame.keys() if int(k) > int(cursor)]
-                    segment_end = min(next_keys) if next_keys else end_frame
-                    segment_end = int(min(segment_end, end_frame))
-                    segment_len = int(max(1, segment_end - cursor))
-                    masks = self._collect_range_masks(model, state, cursor, segment_len)
-                    if not masks:
-                        masks = [torch.zeros((h, w), dtype=torch.float32) for _i in range(segment_len)]
-
-                    active_neg = [tuple(r) for r in (inference_state.get("active_negative_rects") or inference_state.get("negative_rects") or [])]
-                    if active_neg:
-                        stacked_local = torch.stack(masks, dim=0)
-                        stacked_local = _apply_negative_rects(stacked_local, active_neg)
-                        masks = [stacked_local[i] for i in range(int(stacked_local.shape[0]))]
-
-                    for m in masks:
-                        out_chunks.append(m)
-                        progress.update(1)
-                    cursor += segment_len
+                    if frame_idx in applied_frames:
+                        continue
+                    self._apply_prompt_entry(model, state, inference_state, frame_idx, schedule_by_frame[frame_idx])
+                    applied_frames.add(frame_idx)
                 inference_state["prompt_frames_applied"] = sorted(list(applied_frames))
+
+                try:
+                    iterator = model.propagate_in_video(
+                        state,
+                        start_frame_idx=current_start,
+                        max_frame_num_to_track=effective_chunk,
+                    )
+                except TypeError:
+                    iterator = model.propagate_in_video(state)
+
+                for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
+                    idx = int(out_frame_idx)
+                    if idx < current_start:
+                        continue
+                    if idx >= end_frame:
+                        break
+
+                    combined = None
+                    for i, _obj_id in enumerate(out_obj_ids):
+                        current = out_mask_logits[i, 0] > 0.0
+                        combined = current if combined is None else torch.logical_or(combined, current)
+
+                    if combined is None:
+                        _n, _c, h, w = out_mask_logits.shape
+                        combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
+
+                    out_chunks.append(combined.float().cpu())
+                    progress.update(1)
+                    del out_mask_logits
 
         if not out_chunks:
             raise RuntimeError(
                 "SAM2 chunk produced no frames. Check cursor/chunk size and inference state. "
                 "cursor={} chunk={} total={}".format(current_start, effective_chunk, total_frames)
             )
-        if len(out_chunks) < effective_chunk:
-            h = int(image.shape[1])
-            w = int(image.shape[2])
-            out_chunks.extend([torch.zeros((h, w), dtype=torch.float32) for _i in range(effective_chunk - len(out_chunks))])
-        elif len(out_chunks) > effective_chunk:
-            out_chunks = out_chunks[:effective_chunk]
 
         inference_state["next_frame_idx"] = current_start + effective_chunk
         if total_frames > 0 and inference_state["next_frame_idx"] >= total_frames:
