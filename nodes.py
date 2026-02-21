@@ -1876,9 +1876,19 @@ class OpenShotSam2VideoSegmentationChunked:
                 _sam2_add_prompts(model, local_state, 0, obj_id, pts, lbs, [])
             return
 
-        points = np.array(inference_state.get("last_points") or inference_state.get("seed_points") or [], dtype=np.float32)
-        labels = np.array(inference_state.get("last_labels") or inference_state.get("seed_labels") or [], dtype=np.int32)
-        rects = [tuple(r) for r in (inference_state.get("seed_rects") or []) if isinstance(r, (list, tuple)) and len(r) == 4]
+        # Only apply original seed prompts on the very first chunk.
+        # Re-using frame-1 seeds on later chunks can cause background drift
+        # after objects leave frame.
+        next_frame_idx = int(max(0, inference_state.get("next_frame_idx", 0) or 0))
+        use_initial_seed = (next_frame_idx <= 0)
+
+        seed_points = inference_state.get("seed_points") if use_initial_seed else []
+        seed_labels = inference_state.get("seed_labels") if use_initial_seed else []
+        seed_rects = inference_state.get("seed_rects") if use_initial_seed else []
+
+        points = np.array(inference_state.get("last_points") or seed_points or [], dtype=np.float32)
+        labels = np.array(inference_state.get("last_labels") or seed_labels or [], dtype=np.int32)
+        rects = [tuple(r) for r in (seed_rects or []) if isinstance(r, (list, tuple)) and len(r) == 4]
         if points.ndim == 1 and points.size > 0:
             points = points.reshape(1, 2)
         if labels.ndim == 0 and labels.size > 0:
@@ -2029,11 +2039,35 @@ class OpenShotSam2VideoSegmentationChunked:
                                 if torch.any(current):
                                     ys, xs = torch.where(current)
                                     if xs.numel() > 0:
-                                        seen_obj_ids.add(int(_obj_id))
-                                        carries[str(int(_obj_id))] = [
-                                            float(xs.float().mean().item()),
-                                            float(ys.float().mean().item()),
-                                        ]
+                                        obj_id_int = int(_obj_id)
+                                        area = int(xs.numel())
+                                        area_ratio = float(area) / float(max(1, h * w))
+                                        min_x = int(xs.min().item())
+                                        max_x = int(xs.max().item())
+                                        min_y = int(ys.min().item())
+                                        max_y = int(ys.max().item())
+                                        bbox_w = int(max_x - min_x + 1)
+                                        bbox_h = int(max_y - min_y + 1)
+                                        bbox_area = max(1, bbox_w * bbox_h)
+                                        fill_ratio = float(area) / float(bbox_area)
+                                        touches_edge = (min_x <= 1) or (min_y <= 1) or (max_x >= (w - 2)) or (max_y >= (h - 2))
+
+                                        keep_carry = True
+                                        if area_ratio < 0.0002:
+                                            keep_carry = False
+                                        elif area_ratio > 0.35:
+                                            keep_carry = False
+                                        elif touches_edge and area_ratio < 0.003:
+                                            keep_carry = False
+                                        elif fill_ratio < 0.015:
+                                            keep_carry = False
+
+                                        if keep_carry:
+                                            seen_obj_ids.add(obj_id_int)
+                                            carries[str(obj_id_int)] = [
+                                                float(xs.float().mean().item()),
+                                                float(ys.float().mean().item()),
+                                            ]
                             if combined is None:
                                 combined = torch.zeros((h, w), dtype=torch.bool, device=out_mask_logits.device)
                             by_idx[idx] = combined.float().cpu()
@@ -2148,11 +2182,37 @@ class OpenShotSam2VideoSegmentationChunked:
                         if torch.any(current):
                             ys, xs = torch.where(current)
                             if xs.numel() > 0:
-                                seen_obj_ids.add(int(_obj_id))
-                                carries[str(int(_obj_id))] = [
-                                    float(xs.float().mean().item()),
-                                    float(ys.float().mean().item()),
-                                ]
+                                h_cur = int(current.shape[0])
+                                w_cur = int(current.shape[1])
+                                obj_id_int = int(_obj_id)
+                                area = int(xs.numel())
+                                area_ratio = float(area) / float(max(1, h_cur * w_cur))
+                                min_x = int(xs.min().item())
+                                max_x = int(xs.max().item())
+                                min_y = int(ys.min().item())
+                                max_y = int(ys.max().item())
+                                bbox_w = int(max_x - min_x + 1)
+                                bbox_h = int(max_y - min_y + 1)
+                                bbox_area = max(1, bbox_w * bbox_h)
+                                fill_ratio = float(area) / float(bbox_area)
+                                touches_edge = (min_x <= 1) or (min_y <= 1) or (max_x >= (w_cur - 2)) or (max_y >= (h_cur - 2))
+
+                                keep_carry = True
+                                if area_ratio < 0.0002:
+                                    keep_carry = False
+                                elif area_ratio > 0.35:
+                                    keep_carry = False
+                                elif touches_edge and area_ratio < 0.003:
+                                    keep_carry = False
+                                elif fill_ratio < 0.015:
+                                    keep_carry = False
+
+                                if keep_carry:
+                                    seen_obj_ids.add(obj_id_int)
+                                    carries[str(obj_id_int)] = [
+                                        float(xs.float().mean().item()),
+                                        float(ys.float().mean().item()),
+                                    ]
 
                     if combined is None:
                         _n, _c, h, w = out_mask_logits.shape
