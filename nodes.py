@@ -51,7 +51,7 @@ else:
 
 
 SAM2_MODEL_DIR = "sam2"
-OPENSHOT_NODEPACK_VERSION = "v1.0.4-masked-blur-skip-empty"
+OPENSHOT_NODEPACK_VERSION = "v1.1.0-track-object-seeds"
 GROUNDING_DINO_MODEL_IDS = (
     "IDEA-Research/grounding-dino-tiny",
     "IDEA-Research/grounding-dino-base",
@@ -249,6 +249,156 @@ def _parse_points(text):
         except Exception:
             continue
     return pts
+
+
+def _parse_rects(text):
+    text = str(text or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text.replace("'", '"'))
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        if all(k in item for k in ("x1", "y1", "x2", "y2")):
+            try:
+                x1 = float(item["x1"])
+                y1 = float(item["y1"])
+                x2 = float(item["x2"])
+                y2 = float(item["y2"])
+            except Exception:
+                continue
+        elif all(k in item for k in ("x", "y", "w", "h")):
+            try:
+                x1 = float(item["x"])
+                y1 = float(item["y"])
+                x2 = x1 + float(item["w"])
+                y2 = y1 + float(item["h"])
+            except Exception:
+                continue
+        else:
+            continue
+        out.append((x1, y1, x2, y2))
+    return out
+
+
+def _clip_rect(rect, width, height):
+    x1, y1, x2, y2 = [float(v) for v in rect]
+    left = max(0, min(int(np.floor(min(x1, x2))), int(width)))
+    top = max(0, min(int(np.floor(min(y1, y2))), int(height)))
+    right = max(0, min(int(np.ceil(max(x1, x2))), int(width)))
+    bottom = max(0, min(int(np.ceil(max(y1, y2))), int(height)))
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+def _rect_center_points(rects):
+    out = []
+    for x1, y1, x2, y2 in rects:
+        out.append(((float(x1) + float(x2)) * 0.5, (float(y1) + float(y2)) * 0.5))
+    return out
+
+
+def _mask_stack_like(base_mask, image):
+    if base_mask is None:
+        return None
+    mask = base_mask.float()
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if mask.ndim == 4:
+        mask = mask.squeeze(-1)
+    if mask.ndim != 3:
+        return None
+    b = int(image.shape[0])
+    h = int(image.shape[1])
+    w = int(image.shape[2])
+    if int(mask.shape[0]) == 1 and b > 1:
+        mask = mask.repeat(b, 1, 1)
+    if int(mask.shape[0]) != b:
+        return None
+    if int(mask.shape[1]) != h or int(mask.shape[2]) != w:
+        mask = F.interpolate(mask.unsqueeze(1), size=(h, w), mode="nearest").squeeze(1)
+    return torch.clamp(mask, 0.0, 1.0)
+
+
+def _apply_negative_rects(mask_tensor, negative_rects):
+    if mask_tensor is None or not negative_rects:
+        return mask_tensor
+    if mask_tensor.ndim != 3:
+        return mask_tensor
+    h = int(mask_tensor.shape[1])
+    w = int(mask_tensor.shape[2])
+    out = mask_tensor.clone()
+    for rect in negative_rects:
+        clipped = _clip_rect(rect, w, h)
+        if not clipped:
+            continue
+        left, top, right, bottom = clipped
+        out[:, top:bottom, left:right] = 0.0
+    return out
+
+
+def _sam2_add_prompts(model, state, frame_idx, obj_id, coords, labels, positive_rects):
+    errors = []
+    if coords is not None and labels is not None and len(coords) > 0 and len(labels) > 0:
+        for call in (
+            lambda: model.add_new_points(
+                inference_state=state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                points=coords,
+                labels=labels,
+            ),
+            lambda: model.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                points=coords,
+                labels=labels,
+            ),
+        ):
+            try:
+                call()
+                break
+            except Exception as ex:
+                errors.append(str(ex))
+        else:
+            raise RuntimeError("Failed SAM2 add points across API variants: {}".format(errors))
+
+    for rect in positive_rects or []:
+        box = np.array([float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])], dtype=np.float32)
+        rect_errors = []
+        for call in (
+            lambda: model.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                box=box,
+            ),
+            lambda: model.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=int(frame_idx),
+                obj_id=int(obj_id),
+                points=np.empty((0, 2), dtype=np.float32),
+                labels=np.empty((0,), dtype=np.int32),
+                box=box,
+            ),
+        ):
+            try:
+                call()
+                rect_errors = []
+                break
+            except Exception as ex:
+                rect_errors.append(str(ex))
+        if rect_errors:
+            errors.extend(rect_errors)
+    return errors
 
 
 def _resolve_video_path_for_sam2(path_text):
@@ -779,11 +929,15 @@ class OpenShotSam2Segmentation:
             "required": {
                 "sam2_model": ("SAM2MODEL",),
                 "image": ("IMAGE",),
-                "coordinates_positive": ("STRING", {"forceInput": True}),
+                "auto_mode": ("BOOLEAN", {"default": False}),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "coordinates_negative": ("STRING", {"forceInput": True}),
+                "positive_points_json": ("STRING", {"default": ""}),
+                "negative_points_json": ("STRING", {"default": ""}),
+                "positive_rects_json": ("STRING", {"default": ""}),
+                "negative_rects_json": ("STRING", {"default": ""}),
+                "base_mask": ("MASK",),
             },
         }
 
@@ -792,40 +946,81 @@ class OpenShotSam2Segmentation:
     FUNCTION = "segment"
     CATEGORY = "OpenShot/SAM2"
 
-    def segment(self, sam2_model, image, coordinates_positive, keep_model_loaded, coordinates_negative=None):
+    def segment(
+        self,
+        sam2_model,
+        image,
+        auto_mode,
+        keep_model_loaded,
+        positive_points_json="",
+        negative_points_json="",
+        positive_rects_json="",
+        negative_rects_json="",
+        base_mask=None,
+    ):
         _require_sam2()
 
         model = sam2_model["model"]
         device = sam2_model["device"]
         dtype = sam2_model["dtype"]
 
-        positive = _parse_points(coordinates_positive)
-        if not positive:
-            raise ValueError("No positive points provided")
-        negative = _parse_points(coordinates_negative)
-
-        pos_arr = np.array(positive, dtype=np.float32)
-        neg_arr = np.array(negative, dtype=np.float32) if negative else np.empty((0, 2), dtype=np.float32)
-
-        coords = np.concatenate((pos_arr, neg_arr), axis=0)
-        labels = np.concatenate((np.ones((len(pos_arr),), dtype=np.int32), np.zeros((len(neg_arr),), dtype=np.int32)), axis=0)
+        positive = _parse_points(positive_points_json)
+        negative = _parse_points(negative_points_json)
+        positive_rects = _parse_rects(positive_rects_json)
+        negative_rects = _parse_rects(negative_rects_json)
 
         predictor = SAM2ImagePredictor(model)
+        base_mask_stack = _mask_stack_like(base_mask, image)
 
         out_masks = []
         autocast_device = mm.get_autocast_device(device)
         autocast_ok = not mm.is_device_mps(device)
         with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-            for frame in image:
+            for frame_idx, frame in enumerate(image):
                 frame_np = np.clip((frame.cpu().numpy() * 255.0), 0, 255).astype(np.uint8)
                 predictor.set_image(frame_np[..., :3])
-                masks, _scores, _logits = predictor.predict(
-                    point_coords=coords,
-                    point_labels=labels,
-                    multimask_output=False,
-                )
-                mask = masks[0]
-                out_masks.append(torch.from_numpy(mask).float())
+                h, w = frame_np.shape[0], frame_np.shape[1]
+
+                final_mask = torch.zeros((h, w), dtype=torch.float32)
+                if base_mask_stack is not None:
+                    final_mask = torch.maximum(final_mask, (base_mask_stack[frame_idx].cpu() > 0.5).float())
+
+                seed_points = list(positive)
+                if bool(auto_mode) and not seed_points and not positive_rects and base_mask_stack is None:
+                    seed_points = [(float(w) * 0.5, float(h) * 0.5)]
+
+                if seed_points or negative:
+                    pos_arr = np.array(seed_points, dtype=np.float32) if seed_points else np.empty((0, 2), dtype=np.float32)
+                    neg_arr = np.array(negative, dtype=np.float32) if negative else np.empty((0, 2), dtype=np.float32)
+                    coords = np.concatenate((pos_arr, neg_arr), axis=0)
+                    labels = np.concatenate(
+                        (
+                            np.ones((len(pos_arr),), dtype=np.int32),
+                            np.zeros((len(neg_arr),), dtype=np.int32),
+                        ),
+                        axis=0,
+                    )
+                    masks, _scores, _logits = predictor.predict(
+                        point_coords=coords,
+                        point_labels=labels,
+                        multimask_output=False,
+                    )
+                    final_mask = torch.maximum(final_mask, torch.from_numpy(masks[0]).float())
+
+                for rect in positive_rects:
+                    clipped = _clip_rect(rect, w, h)
+                    if not clipped:
+                        continue
+                    left, top, right, bottom = clipped
+                    box = np.array([float(left), float(top), float(right), float(bottom)], dtype=np.float32)
+                    try:
+                        masks, _scores, _logits = predictor.predict(box=box, multimask_output=False)
+                    except TypeError:
+                        masks, _scores, _logits = predictor.predict(box=box, point_coords=None, point_labels=None, multimask_output=False)
+                    final_mask = torch.maximum(final_mask, torch.from_numpy(masks[0]).float())
+
+                final_mask = _apply_negative_rects(final_mask.unsqueeze(0), negative_rects).squeeze(0)
+                out_masks.append(torch.clamp(final_mask, 0.0, 1.0))
 
         if not keep_model_loaded:
             model.to(mm.unet_offload_device())
@@ -844,18 +1039,22 @@ class OpenShotSam2VideoSegmentationAddPoints:
         return {
             "required": {
                 "sam2_model": ("SAM2MODEL",),
-                "coordinates_positive": ("STRING", {"forceInput": True}),
                 "frame_index": ("INT", {"default": 0, "min": 0}),
                 "object_index": ("INT", {"default": 0, "min": 0}),
                 "windowed_mode": ("BOOLEAN", {"default": True}),
                 "offload_video_to_cpu": ("BOOLEAN", {"default": False}),
                 "offload_state_to_cpu": ("BOOLEAN", {"default": False}),
+                "auto_mode": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "image": ("IMAGE",),
                 "video_path": ("STRING", {"default": ""}),
-                "coordinates_negative": ("STRING", {"forceInput": True}),
+                "positive_points_json": ("STRING", {"default": ""}),
+                "negative_points_json": ("STRING", {"default": ""}),
+                "positive_rects_json": ("STRING", {"default": ""}),
+                "negative_rects_json": ("STRING", {"default": ""}),
                 "prev_inference_state": ("SAM2INFERENCESTATE",),
+                "base_mask": ("MASK",),
             },
         }
 
@@ -867,16 +1066,20 @@ class OpenShotSam2VideoSegmentationAddPoints:
     def add_points(
         self,
         sam2_model,
-        coordinates_positive,
         frame_index,
         object_index,
         windowed_mode,
         offload_video_to_cpu,
         offload_state_to_cpu,
+        auto_mode,
         image=None,
         video_path="",
-        coordinates_negative=None,
+        positive_points_json="",
+        negative_points_json="",
+        positive_rects_json="",
+        negative_rects_json="",
         prev_inference_state=None,
+        base_mask=None,
     ):
         model = sam2_model["model"]
         device = sam2_model["device"]
@@ -885,16 +1088,32 @@ class OpenShotSam2VideoSegmentationAddPoints:
         if segmentor != "video":
             raise ValueError("Loaded SAM2 model is not configured for video")
 
-        pos = _parse_points(coordinates_positive)
-        if not pos:
-            raise ValueError("No positive points provided")
-        neg = _parse_points(coordinates_negative)
+        pos = _parse_points(positive_points_json)
+        neg = _parse_points(negative_points_json)
+        pos_rects = _parse_rects(positive_rects_json)
+        neg_rects = _parse_rects(negative_rects_json)
 
-        pos_arr = np.atleast_2d(np.array(pos, dtype=np.float32))
+        if base_mask is not None:
+            mask_stack = _mask_stack_like(base_mask, image) if image is not None else None
+            if mask_stack is not None and int(mask_stack.shape[0]) > 0:
+                ys, xs = torch.where(mask_stack[0] > 0.5)
+                if xs.numel() > 0:
+                    pos.append((float(xs.float().mean().item()), float(ys.float().mean().item())))
+
+        if bool(auto_mode) and (not pos) and (not pos_rects):
+            if image is not None:
+                h = int(image.shape[1])
+                w = int(image.shape[2])
+                pos = [(float(w) * 0.5, float(h) * 0.5)]
+
+        if (not pos) and (not pos_rects):
+            raise ValueError("No positive points/rectangles provided")
+
+        pos_arr = np.atleast_2d(np.array(pos, dtype=np.float32)) if pos else np.empty((0, 2), dtype=np.float32)
         neg_arr = np.atleast_2d(np.array(neg, dtype=np.float32)) if neg else np.empty((0, 2), dtype=np.float32)
 
-        coords = np.concatenate((pos_arr, neg_arr), axis=0)
-        labels = np.concatenate((np.ones((len(pos_arr),), dtype=np.int32), np.zeros((len(neg_arr),), dtype=np.int32)), axis=0)
+        coords = np.concatenate((pos_arr, neg_arr), axis=0) if (len(pos_arr) or len(neg_arr)) else np.empty((0, 2), dtype=np.float32)
+        labels = np.concatenate((np.ones((len(pos_arr),), dtype=np.int32), np.zeros((len(neg_arr),), dtype=np.int32)), axis=0) if (len(pos_arr) or len(neg_arr)) else np.empty((0,), dtype=np.int32)
 
         # Windowed mode does not hold full-video SAM2 state in memory.
         if bool(windowed_mode):
@@ -904,6 +1123,8 @@ class OpenShotSam2VideoSegmentationAddPoints:
             state["seed_labels"] = labels.tolist()
             state["last_points"] = coords.tolist()
             state["last_labels"] = labels.tolist()
+            state["seed_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in pos_rects]
+            state["negative_rects"] = [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in neg_rects]
             state["object_index"] = int(object_index)
             state["next_frame_idx"] = int(max(0, frame_index))
             state["num_frames"] = int(state.get("num_frames", 0) or 0)
@@ -988,32 +1209,17 @@ class OpenShotSam2VideoSegmentationAddPoints:
         autocast_ok = not mm.is_device_mps(device)
         with torch.inference_mode():
             with torch.autocast(autocast_device, dtype=dtype) if autocast_ok else nullcontext():
-                add_errors = []
-                added = False
-                for call in (
-                    lambda: model.add_new_points(
-                        inference_state=state,
-                        frame_idx=int(frame_index),
-                        obj_id=int(object_index),
-                        points=coords,
-                        labels=labels,
-                    ),
-                    lambda: model.add_new_points_or_box(
-                        inference_state=state,
-                        frame_idx=int(frame_index),
-                        obj_id=int(object_index),
-                        points=coords,
-                        labels=labels,
-                    ),
-                ):
-                    try:
-                        call()
-                        added = True
-                        break
-                    except Exception as ex:
-                        add_errors.append(str(ex))
-                if not added:
-                    raise RuntimeError("Failed SAM2 add points across API variants: {}".format(add_errors))
+                add_errors = _sam2_add_prompts(
+                    model,
+                    state,
+                    int(frame_index),
+                    int(object_index),
+                    coords,
+                    labels,
+                    pos_rects,
+                )
+                if add_errors:
+                    raise RuntimeError("Failed applying one or more SAM2 rectangle prompts: {}".format(add_errors[:3]))
 
         if num_frames <= 0:
             try:
@@ -1030,6 +1236,8 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 "inference_state": state,
                 "num_frames": num_frames,
                 "next_frame_idx": int(max(0, frame_index)),
+                "negative_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in neg_rects],
+                "seed_rects": [[float(a), float(b), float(c), float(d)] for (a, b, c, d) in pos_rects],
             },
         )
 
@@ -1119,34 +1327,19 @@ class OpenShotSam2VideoSegmentationChunked:
     def _add_prompt_points(self, model, local_state, inference_state):
         points = np.array(inference_state.get("last_points") or inference_state.get("seed_points") or [], dtype=np.float32)
         labels = np.array(inference_state.get("last_labels") or inference_state.get("seed_labels") or [], dtype=np.int32)
-        if points.size == 0 or labels.size == 0:
-            raise ValueError("Windowed SAM2 tracker has no valid prompt points")
-        if points.ndim == 1:
+        rects = [tuple(r) for r in (inference_state.get("seed_rects") or []) if isinstance(r, (list, tuple)) and len(r) == 4]
+        if points.ndim == 1 and points.size > 0:
             points = points.reshape(1, 2)
+        if labels.ndim == 0 and labels.size > 0:
+            labels = labels.reshape(1)
+        if (points.size == 0 or labels.size == 0) and rects:
+            centers = _rect_center_points(rects)
+            points = np.array(centers, dtype=np.float32)
+            labels = np.ones((len(centers),), dtype=np.int32)
+        if points.size == 0 and not rects:
+            raise ValueError("Windowed SAM2 tracker has no valid prompt points/rectangles")
         obj_id = int(inference_state.get("object_index", 0))
-        errors = []
-        for call in (
-            lambda: model.add_new_points(
-                inference_state=local_state,
-                frame_idx=0,
-                obj_id=obj_id,
-                points=points,
-                labels=labels,
-            ),
-            lambda: model.add_new_points_or_box(
-                inference_state=local_state,
-                frame_idx=0,
-                obj_id=obj_id,
-                points=points,
-                labels=labels,
-            ),
-        ):
-            try:
-                call()
-                return
-            except Exception as ex:
-                errors.append(str(ex))
-        raise RuntimeError("Windowed SAM2 add points failed: {}".format(errors))
+        _sam2_add_prompts(model, local_state, 0, obj_id, points, labels, rects)
 
     def _update_prompt_from_last_mask(self, inference_state, masks):
         last = None
@@ -1223,7 +1416,9 @@ class OpenShotSam2VideoSegmentationChunked:
                 model.to(mm.unet_offload_device())
                 mm.soft_empty_cache()
 
-        return (torch.stack(out_chunks, dim=0),)
+        stacked = torch.stack(out_chunks, dim=0)
+        stacked = _apply_negative_rects(stacked, [tuple(r) for r in (inference_state.get("negative_rects") or [])])
+        return (stacked,)
 
     def segment_chunk(self, sam2_model, inference_state, image, start_frame, chunk_size_frames, keep_model_loaded, meta_batch=None):
         model = sam2_model["model"]
@@ -1315,7 +1510,9 @@ class OpenShotSam2VideoSegmentationChunked:
             model.to(mm.unet_offload_device())
             mm.soft_empty_cache()
 
-        return (torch.stack(out_chunks, dim=0),)
+        stacked = torch.stack(out_chunks, dim=0)
+        stacked = _apply_negative_rects(stacked, [tuple(r) for r in (inference_state.get("negative_rects") or [])])
+        return (stacked,)
 
 
 def _gaussian_kernel(kernel_size, sigma, device, dtype):
