@@ -1784,6 +1784,7 @@ class OpenShotSam2VideoSegmentationChunked:
 
                     by_idx = {}
                     carries = dict(inference_state.get("object_carries", {}) or {})
+                    seen_obj_ids = set()
                     for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
                         idx = int(out_frame_idx)
                         if idx < 0 or idx >= bsz:
@@ -1795,6 +1796,7 @@ class OpenShotSam2VideoSegmentationChunked:
                             if torch.any(current):
                                 ys, xs = torch.where(current)
                                 if xs.numel() > 0:
+                                    seen_obj_ids.add(int(_obj_id))
                                     carries[str(int(_obj_id))] = [
                                         float(xs.float().mean().item()),
                                         float(ys.float().mean().item()),
@@ -1804,7 +1806,11 @@ class OpenShotSam2VideoSegmentationChunked:
                         by_idx[idx] = combined.float().cpu()
                         progress.update(1)
                         del out_mask_logits
-                    inference_state["object_carries"] = carries
+                    inference_state["object_carries"] = {
+                        str(obj_id): carries.get(str(obj_id))
+                        for obj_id in sorted(seen_obj_ids)
+                        if str(obj_id) in carries
+                    }
 
             for i in range(bsz):
                 out_chunks.append(by_idx.get(i, torch.zeros((h, w), dtype=torch.float32)))
@@ -1893,6 +1899,8 @@ class OpenShotSam2VideoSegmentationChunked:
                 except TypeError:
                     iterator = model.propagate_in_video(state)
 
+                carries = dict(inference_state.get("object_carries", {}) or {})
+                seen_obj_ids = set()
                 for out_frame_idx, out_obj_ids, out_mask_logits in iterator:
                     idx = int(out_frame_idx)
                     if idx < current_start:
@@ -1901,18 +1909,17 @@ class OpenShotSam2VideoSegmentationChunked:
                         break
 
                     combined = None
-                    carries = dict(inference_state.get("object_carries", {}) or {})
                     for i, _obj_id in enumerate(out_obj_ids):
                         current = out_mask_logits[i, 0] > 0.0
                         combined = current if combined is None else torch.logical_or(combined, current)
                         if torch.any(current):
                             ys, xs = torch.where(current)
                             if xs.numel() > 0:
+                                seen_obj_ids.add(int(_obj_id))
                                 carries[str(int(_obj_id))] = [
                                     float(xs.float().mean().item()),
                                     float(ys.float().mean().item()),
                                 ]
-                    inference_state["object_carries"] = carries
 
                     if combined is None:
                         _n, _c, h, w = out_mask_logits.shape
@@ -1921,6 +1928,11 @@ class OpenShotSam2VideoSegmentationChunked:
                     out_chunks.append(combined.float().cpu())
                     progress.update(1)
                     del out_mask_logits
+                inference_state["object_carries"] = {
+                    str(obj_id): carries.get(str(obj_id))
+                    for obj_id in sorted(seen_obj_ids)
+                    if str(obj_id) in carries
+                }
 
         if not out_chunks:
             raise RuntimeError(
@@ -1950,6 +1962,31 @@ def _gaussian_kernel(kernel_size, sigma, device, dtype):
     d = torch.sqrt(x * x + y * y)
     g = torch.exp(-(d * d) / (2.0 * sigma * sigma))
     return g / g.sum()
+
+
+def _parse_color_rgba(color_text, default=(1.0, 1.0, 0.0, 1.0)):
+    text = str(color_text or "").strip().lower()
+    if not text:
+        return default
+    if text == "transparent":
+        return (0.0, 0.0, 0.0, 0.0)
+    if text.startswith("#"):
+        raw = text[1:]
+        try:
+            if len(raw) == 6:
+                r = int(raw[0:2], 16) / 255.0
+                g = int(raw[2:4], 16) / 255.0
+                b = int(raw[4:6], 16) / 255.0
+                return (r, g, b, 1.0)
+            if len(raw) == 8:
+                r = int(raw[0:2], 16) / 255.0
+                g = int(raw[2:4], 16) / 255.0
+                b = int(raw[4:6], 16) / 255.0
+                a = int(raw[6:8], 16) / 255.0
+                return (r, g, b, a)
+        except Exception:
+            return default
+    return default
 
 
 class OpenShotImageBlurMasked:
@@ -2007,6 +2044,81 @@ class OpenShotImageBlurMasked:
 
         composited = work * (1.0 - work_mask) + blurred * work_mask
         out[idx] = composited
+        return (out.to(mm.intermediate_device()),)
+
+
+class OpenShotImageHighlightMasked:
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return ""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "highlight_color": ("STRING", {"default": "#F5D742"}),
+                "highlight_opacity": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "border_color": ("STRING", {"default": "transparent"}),
+                "border_width": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "highlight_masked"
+    CATEGORY = "OpenShot/Video"
+
+    def highlight_masked(self, image, mask, highlight_color, highlight_opacity, border_color, border_width):
+        hi_r, hi_g, hi_b, hi_a = _parse_color_rgba(highlight_color, default=(0.96, 0.84, 0.26, 1.0))
+        bo_r, bo_g, bo_b, bo_a = _parse_color_rgba(border_color, default=(0.0, 0.0, 0.0, 0.0))
+        hi_alpha = float(max(0.0, min(1.0, float(highlight_opacity)))) * float(hi_a)
+        border_width = int(max(0, border_width))
+
+        if hi_alpha <= 0.0 and (border_width <= 0 or bo_a <= 0.0):
+            return (image,)
+
+        device = mm.get_torch_device()
+        img = image.to(device)
+        m = mask.to(device).float()
+        if m.ndim == 2:
+            m = m.unsqueeze(0)
+        if m.ndim == 4:
+            m = m.squeeze(-1)
+        if m.ndim != 3:
+            return (image,)
+        m = torch.clamp(m, 0.0, 1.0)
+        if int(m.shape[0]) == 1 and int(img.shape[0]) > 1:
+            m = m.repeat(int(img.shape[0]), 1, 1)
+        if int(m.shape[0]) != int(img.shape[0]):
+            return (image,)
+
+        has_mask = (m.view(m.shape[0], -1).max(dim=1).values > 0)
+        if not bool(has_mask.any()):
+            return (image,)
+
+        out = img.clone()
+        idx = torch.nonzero(has_mask, as_tuple=False).squeeze(1)
+        work = img[idx]
+        work_mask = m[idx].unsqueeze(-1)
+
+        if hi_alpha > 0.0:
+            hi_color = torch.tensor([hi_r, hi_g, hi_b], device=work.device, dtype=work.dtype).view(1, 1, 1, 3)
+            fill_alpha = torch.clamp(work_mask * hi_alpha, 0.0, 1.0)
+            work = work * (1.0 - fill_alpha) + hi_color * fill_alpha
+
+        if border_width > 0 and bo_a > 0.0:
+            k = border_width * 2 + 1
+            base = work_mask.permute(0, 3, 1, 2)
+            dilated = F.max_pool2d(base, kernel_size=k, stride=1, padding=border_width)
+            border = torch.clamp(dilated - base, 0.0, 1.0).permute(0, 2, 3, 1)
+            if torch.any(border > 0.0):
+                bo_color = torch.tensor([bo_r, bo_g, bo_b], device=work.device, dtype=work.dtype).view(1, 1, 1, 3)
+                border_alpha = torch.clamp(border * bo_a, 0.0, 1.0)
+                work = work * (1.0 - border_alpha) + bo_color * border_alpha
+
+        out[idx] = work
         return (out.to(mm.intermediate_device()),)
 
 
@@ -2145,6 +2257,7 @@ NODE_CLASS_MAPPINGS = {
     "OpenShotSam2VideoSegmentationAddPoints": OpenShotSam2VideoSegmentationAddPoints,
     "OpenShotSam2VideoSegmentationChunked": OpenShotSam2VideoSegmentationChunked,
     "OpenShotImageBlurMasked": OpenShotImageBlurMasked,
+    "OpenShotImageHighlightMasked": OpenShotImageHighlightMasked,
     "OpenShotGroundingDinoDetect": OpenShotGroundingDinoDetect,
     "OpenShotSceneRangesFromSegments": OpenShotSceneRangesFromSegments,
 }
@@ -2156,6 +2269,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OpenShotSam2VideoSegmentationAddPoints": "OpenShot SAM2 Add Video Points",
     "OpenShotSam2VideoSegmentationChunked": "OpenShot SAM2 Video Segmentation (Chunked)",
     "OpenShotImageBlurMasked": "OpenShot Blur Masked (Skip Empty)",
+    "OpenShotImageHighlightMasked": "OpenShot Highlight Masked",
     "OpenShotGroundingDinoDetect": "OpenShot GroundingDINO Detect",
     "OpenShotSceneRangesFromSegments": "OpenShot Scene Ranges From Segments",
 }
