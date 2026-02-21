@@ -2172,6 +2172,8 @@ class OpenShotImageHighlightMasked:
                 "highlight_opacity": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "border_color": ("STRING", {"default": "transparent"}),
                 "border_width": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+                "mask_brightness": ("FLOAT", {"default": 1.15, "min": 0.0, "max": 3.0, "step": 0.01}),
+                "background_brightness": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 3.0, "step": 0.01}),
             },
         }
 
@@ -2180,11 +2182,23 @@ class OpenShotImageHighlightMasked:
     FUNCTION = "highlight_masked"
     CATEGORY = "OpenShot/Video"
 
-    def highlight_masked(self, image, mask, highlight_color, highlight_opacity, border_color, border_width):
+    def highlight_masked(
+        self,
+        image,
+        mask,
+        highlight_color,
+        highlight_opacity,
+        border_color,
+        border_width,
+        mask_brightness,
+        background_brightness,
+    ):
         hi_r, hi_g, hi_b, hi_a = _parse_color_rgba(highlight_color, default=(0.96, 0.84, 0.26, 1.0))
         bo_r, bo_g, bo_b, bo_a = _parse_color_rgba(border_color, default=(0.0, 0.0, 0.0, 0.0))
         hi_alpha = float(max(0.0, min(1.0, float(highlight_opacity)))) * float(hi_a)
         border_width = int(max(0, border_width))
+        mask_brightness = float(max(0.0, min(3.0, float(mask_brightness))))
+        background_brightness = float(max(0.0, min(3.0, float(background_brightness))))
 
         if hi_alpha <= 0.0 and (border_width <= 0 or bo_a <= 0.0):
             return (image,)
@@ -2212,6 +2226,9 @@ class OpenShotImageHighlightMasked:
         idx = torch.nonzero(has_mask, as_tuple=False).squeeze(1)
         work = img[idx]
         work_mask = m[idx].unsqueeze(-1)
+        work_bg = torch.clamp(work * background_brightness, 0.0, 1.0)
+        work_fg = torch.clamp(work * mask_brightness, 0.0, 1.0)
+        work = work_bg * (1.0 - work_mask) + work_fg * work_mask
 
         if hi_alpha > 0.0:
             hi_color = torch.tensor([hi_r, hi_g, hi_b], device=work.device, dtype=work.dtype).view(1, 1, 1, 3)
