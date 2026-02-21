@@ -59,8 +59,8 @@ GROUNDING_DINO_MODEL_IDS = (
 )
 GROUNDING_DINO_CACHE = {}
 def _sam2_debug_enabled():
-    v = str(os.environ.get("OPENSHOT_SAM2_DEBUG", "")).strip().lower()
-    return v in ("1", "true", "yes", "on", "debug")
+    # Temporary: always-on debug while we diagnose chunk/carry drift.
+    return True
 
 
 def _sam2_debug(*parts):
