@@ -548,10 +548,41 @@ def _detect_groundingdino_boxes(image_tensor, prompt, model_id, box_threshold, t
                     target_sizes=[(h, w)],
                 )[0]
         boxes = result.get("boxes")
+        labels = result.get("labels")
+        scores = result.get("scores")
         if boxes is None or boxes.numel() == 0:
+            _sam2_debug("dino-detect", "prompt=", prompt, "detections=0")
             return []
+
         boxes_cpu = boxes.detach().cpu()
-        return [tuple(float(v) for v in boxes_cpu[i].tolist()) for i in range(int(boxes_cpu.shape[0]))]
+        out_boxes = [tuple(float(v) for v in boxes_cpu[i].tolist()) for i in range(int(boxes_cpu.shape[0]))]
+
+        # Detailed detection diagnostics for prompt-quality debugging.
+        details = []
+        for i in range(int(boxes_cpu.shape[0])):
+            try:
+                lbl = str(labels[i]) if labels is not None else ""
+            except Exception:
+                lbl = ""
+            try:
+                score = float(scores[i].item()) if scores is not None else 0.0
+            except Exception:
+                score = 0.0
+            b = out_boxes[i]
+            details.append({
+                "i": i,
+                "label": lbl,
+                "score": round(score, 4),
+                "box": [round(float(b[0]), 1), round(float(b[1]), 1), round(float(b[2]), 1), round(float(b[3]), 1)],
+            })
+        _sam2_debug(
+            "dino-detect",
+            "prompt=", prompt,
+            "detections=", len(out_boxes),
+            "details=", json.dumps(details[:12]),
+        )
+
+        return out_boxes
 
 
 def _sam2_add_prompts(model, state, frame_idx, obj_id, coords, labels, positive_rects):
@@ -1451,6 +1482,11 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 seed_rects.extend([tuple(b) for b in dino_boxes])
                 seed_entry["positive_rects"] = seed_rects
                 prompt_schedule[int(seed_frame_idx)] = seed_entry
+                _sam2_debug(
+                    "dino-seed-boxes",
+                    "seed_frame_idx=", int(seed_frame_idx),
+                    "boxes=", json.dumps([[round(float(v),1) for v in b] for b in dino_boxes[:12]]),
+                )
 
         # Backward-compatible seed injection if no explicit keyframed payload exists.
         if seed_frame_idx not in prompt_schedule and (pos or neg or pos_rects or neg_rects):
