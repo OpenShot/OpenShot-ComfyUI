@@ -508,13 +508,32 @@ def _detect_groundingdino_boxes(image_tensor, prompt, model_id, box_threshold, t
         inputs = processor(images=pil, text=prompt, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         outputs = model(**inputs)
-        result = processor.post_process_grounded_object_detection(
-            outputs,
-            inputs["input_ids"],
-            box_threshold=float(box_threshold),
-            text_threshold=float(text_threshold),
-            target_sizes=[(h, w)],
-        )[0]
+        post_kwargs = {
+            "target_sizes": [(h, w)],
+            "text_threshold": float(text_threshold),
+        }
+        try:
+            result = processor.post_process_grounded_object_detection(
+                outputs,
+                inputs["input_ids"],
+                box_threshold=float(box_threshold),
+                **post_kwargs,
+            )[0]
+        except TypeError:
+            try:
+                result = processor.post_process_grounded_object_detection(
+                    outputs,
+                    inputs["input_ids"],
+                    threshold=float(box_threshold),
+                    **post_kwargs,
+                )[0]
+            except TypeError:
+                result = processor.post_process_grounded_object_detection(
+                    outputs,
+                    inputs["input_ids"],
+                    threshold=float(box_threshold),
+                    target_sizes=[(h, w)],
+                )[0]
         boxes = result.get("boxes")
         if boxes is None or boxes.numel() == 0:
             return []
@@ -2442,13 +2461,32 @@ class OpenShotGroundingDinoDetect:
                 inputs = processor(images=pil, text=prompt, return_tensors="pt")
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 outputs = model(**inputs)
-                result = processor.post_process_grounded_object_detection(
-                    outputs,
-                    inputs["input_ids"],
-                    box_threshold=float(box_threshold),
-                    text_threshold=float(text_threshold),
-                    target_sizes=[(height, width)],
-                )[0]
+                post_kwargs = {
+                    "target_sizes": [(height, width)],
+                    "text_threshold": float(text_threshold),
+                }
+                try:
+                    result = processor.post_process_grounded_object_detection(
+                        outputs,
+                        inputs["input_ids"],
+                        box_threshold=float(box_threshold),
+                        **post_kwargs,
+                    )[0]
+                except TypeError:
+                    try:
+                        result = processor.post_process_grounded_object_detection(
+                            outputs,
+                            inputs["input_ids"],
+                            threshold=float(box_threshold),
+                            **post_kwargs,
+                        )[0]
+                    except TypeError:
+                        result = processor.post_process_grounded_object_detection(
+                            outputs,
+                            inputs["input_ids"],
+                            threshold=float(box_threshold),
+                            target_sizes=[(height, width)],
+                        )[0]
 
                 boxes = result.get("boxes")
                 labels = result.get("labels")
