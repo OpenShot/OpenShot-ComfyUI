@@ -56,6 +56,7 @@ GROUNDING_DINO_MODEL_IDS = (
     "IDEA-Research/grounding-dino-tiny",
     "IDEA-Research/grounding-dino-base",
 )
+GROUNDING_DINO_CACHE = {}
 SAM2_MODELS = {
     "sam2.1_hiera_tiny.safetensors": {
         "url": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt",
@@ -461,6 +462,63 @@ def _apply_negative_rects(mask_tensor, negative_rects):
         left, top, right, bottom = clipped
         out[:, top:bottom, left:right] = 0.0
     return out
+
+
+def _tensor_to_pil_image(img):
+    arr = torch.clamp(img, 0.0, 1.0).mul(255.0).byte().cpu().numpy()
+    return Image.fromarray(arr)
+
+
+def _resolve_dino_device(device_name):
+    device_name = str(device_name or "auto").strip().lower()
+    if device_name == "auto":
+        return mm.get_torch_device()
+    return torch.device(device_name)
+
+
+def _get_groundingdino_model_and_processor(model_id, device):
+    key = "{}::{}".format(str(model_id), str(device))
+    if key in GROUNDING_DINO_CACHE:
+        return GROUNDING_DINO_CACHE[key]
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
+    model.to(device)
+    model.eval()
+    GROUNDING_DINO_CACHE[key] = (processor, model)
+    return processor, model
+
+
+def _detect_groundingdino_boxes(image_tensor, prompt, model_id, box_threshold, text_threshold, device_name):
+    prompt = str(prompt or "").strip()
+    if not prompt:
+        return []
+    _require_groundingdino()
+    if not prompt.endswith("."):
+        prompt = "{}.".format(prompt)
+    if image_tensor is None or int(image_tensor.shape[0]) <= 0:
+        return []
+
+    device = _resolve_dino_device(device_name)
+    processor, model = _get_groundingdino_model_and_processor(model_id, device)
+    pil = _tensor_to_pil_image(image_tensor[0])
+    h = int(image_tensor.shape[1])
+    w = int(image_tensor.shape[2])
+    with torch.inference_mode():
+        inputs = processor(images=pil, text=prompt, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        outputs = model(**inputs)
+        result = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs["input_ids"],
+            box_threshold=float(box_threshold),
+            text_threshold=float(text_threshold),
+            target_sizes=[(h, w)],
+        )[0]
+        boxes = result.get("boxes")
+        if boxes is None or boxes.numel() == 0:
+            return []
+        boxes_cpu = boxes.detach().cpu()
+        return [tuple(float(v) for v in boxes_cpu[i].tolist()) for i in range(int(boxes_cpu.shape[0]))]
 
 
 def _sam2_add_prompts(model, state, frame_idx, obj_id, coords, labels, positive_rects):
@@ -1173,6 +1231,11 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 "positive_rects_json": ("STRING", {"default": ""}),
                 "negative_rects_json": ("STRING", {"default": ""}),
                 "tracking_selection_json": ("STRING", {"default": "{}"}),
+                "dino_prompt": ("STRING", {"default": ""}),
+                "dino_model_id": (GROUNDING_DINO_MODEL_IDS,),
+                "dino_box_threshold": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dino_text_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dino_device": (("auto", "cpu", "cuda", "mps"),),
                 "prev_inference_state": ("SAM2INFERENCESTATE",),
                 "base_mask": ("MASK",),
             },
@@ -1199,6 +1262,11 @@ class OpenShotSam2VideoSegmentationAddPoints:
         positive_rects_json="",
         negative_rects_json="",
         tracking_selection_json="{}",
+        dino_prompt="",
+        dino_model_id="IDEA-Research/grounding-dino-tiny",
+        dino_box_threshold=0.35,
+        dino_text_threshold=0.25,
+        dino_device="auto",
         prev_inference_state=None,
         base_mask=None,
     ):
@@ -1229,6 +1297,44 @@ class OpenShotSam2VideoSegmentationAddPoints:
                 h = int(image.shape[1])
                 w = int(image.shape[2])
                 pos = [(float(w) * 0.5, float(h) * 0.5)]
+
+        dino_prompt = str(dino_prompt or "").strip()
+        if dino_prompt and image is not None:
+            try:
+                dino_boxes = _detect_groundingdino_boxes(
+                    image,
+                    dino_prompt,
+                    dino_model_id,
+                    float(dino_box_threshold),
+                    float(dino_text_threshold),
+                    dino_device,
+                )
+            except Exception:
+                dino_boxes = []
+            if dino_boxes:
+                seed_entry = dict(prompt_schedule.get(seed_frame_idx, {}) or {})
+                seed_object_prompts = list(seed_entry.get("object_prompts") or [])
+                next_obj_id = 0
+                for op in seed_object_prompts:
+                    try:
+                        next_obj_id = max(next_obj_id, int(op.get("obj_id", 0)) + 1)
+                    except Exception:
+                        continue
+                for box in dino_boxes:
+                    seed_object_prompts.append(
+                        {
+                            "obj_id": int(next_obj_id),
+                            "points": [],
+                            "labels": [],
+                            "positive_rects": [tuple(box)],
+                        }
+                    )
+                    next_obj_id += 1
+                seed_entry["object_prompts"] = seed_object_prompts
+                seed_rects = list(seed_entry.get("positive_rects") or [])
+                seed_rects.extend([tuple(b) for b in dino_boxes])
+                seed_entry["positive_rects"] = seed_rects
+                prompt_schedule[int(seed_frame_idx)] = seed_entry
 
         # Backward-compatible seed injection if no explicit keyframed payload exists.
         if seed_frame_idx not in prompt_schedule and (pos or neg or pos_rects or neg_rects):
@@ -1608,6 +1714,7 @@ class OpenShotSam2VideoSegmentationChunked:
         labels_list = [int(v) for v in (entry.get("labels") or [])]
         rects = [tuple(r) for r in (entry.get("positive_rects") or [])]
         neg_rects = [tuple(r) for r in (entry.get("negative_rects") or [])]
+        global_negative_points = [p for p, lbl in zip(points_list, labels_list) if int(lbl) == 0]
 
         points = np.array(points_list, dtype=np.float32) if points_list else np.empty((0, 2), dtype=np.float32)
         labels = np.array(labels_list, dtype=np.int32) if labels_list else np.empty((0,), dtype=np.int32)
@@ -1629,6 +1736,9 @@ class OpenShotSam2VideoSegmentationChunked:
                 op_points_list = list(op.get("points") or [])
                 op_labels_list = [int(v) for v in (op.get("labels") or [])]
                 op_rects = [tuple(r) for r in (op.get("positive_rects") or [])]
+                if global_negative_points:
+                    op_points_list = list(op_points_list) + list(global_negative_points)
+                    op_labels_list = list(op_labels_list) + [0 for _ in global_negative_points]
                 op_points = np.array(op_points_list, dtype=np.float32) if op_points_list else np.empty((0, 2), dtype=np.float32)
                 op_labels = np.array(op_labels_list, dtype=np.int32) if op_labels_list else np.empty((0,), dtype=np.int32)
                 if op_points.ndim == 1 and op_points.size > 0:
