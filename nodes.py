@@ -1217,6 +1217,11 @@ class OpenShotSam2Segmentation:
                 "negative_points_json": ("STRING", {"default": ""}),
                 "positive_rects_json": ("STRING", {"default": ""}),
                 "negative_rects_json": ("STRING", {"default": ""}),
+                "dino_prompt": ("STRING", {"default": ""}),
+                "dino_model_id": (GROUNDING_DINO_MODEL_IDS,),
+                "dino_box_threshold": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dino_text_threshold": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "dino_device": (("auto", "cpu", "cuda", "mps"),),
                 "base_mask": ("MASK",),
                 "meta_batch": ("VHS_BatchManager",),
             },
@@ -1237,6 +1242,11 @@ class OpenShotSam2Segmentation:
         negative_points_json="",
         positive_rects_json="",
         negative_rects_json="",
+        dino_prompt="",
+        dino_model_id="IDEA-Research/grounding-dino-tiny",
+        dino_box_threshold=0.35,
+        dino_text_threshold=0.25,
+        dino_device="auto",
         base_mask=None,
     ):
         _require_sam2()
@@ -1288,7 +1298,21 @@ class OpenShotSam2Segmentation:
                     )
                     final_mask = torch.maximum(final_mask, torch.from_numpy(masks[0]).float())
 
-                for rect in positive_rects:
+                frame_positive_rects = list(positive_rects)
+                dino_prompt_text = str(dino_prompt or "").strip()
+                if dino_prompt_text:
+                    dino_boxes = _detect_groundingdino_boxes(
+                        image[frame_idx:frame_idx + 1],
+                        dino_prompt_text,
+                        dino_model_id,
+                        float(dino_box_threshold),
+                        float(dino_text_threshold),
+                        dino_device,
+                    )
+                    if dino_boxes:
+                        frame_positive_rects.extend([tuple(box) for box in dino_boxes])
+
+                for rect in frame_positive_rects:
                     clipped = _clip_rect(rect, w, h)
                     if not clipped:
                         continue
