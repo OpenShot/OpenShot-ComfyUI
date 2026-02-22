@@ -1995,7 +1995,10 @@ class OpenShotSam2VideoSegmentationChunked:
                         b = tuple(op_rects[0])
                         bx = [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
                     else:
-                        bx = [px - 1.0, py - 1.0, px + 1.0, py + 1.0]
+                        # Do not invent a tiny bbox for point-only prompts.
+                        # Boundary replay should use the point itself unless we
+                        # have a real object bbox from SAM2 propagation.
+                        bx = None
                     carries[str(int(obj_id))] = {"point": [px, py], "bbox": bx}
                     inference_state["object_carries"] = carries
         else:
