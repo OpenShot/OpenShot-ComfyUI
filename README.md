@@ -1,8 +1,23 @@
 # OpenShot-ComfyUI
 
-OpenShot-focused ComfyUI nodes for robust video workflows.
+OpenShot-ComfyUI provides production-focused ComfyUI nodes built for OpenShot integration, with a strong focus on reliable SAM2 workflows for longer videos.
 
-This V1 intentionally stays close to standard ComfyUI primitives and types while fixing long-video SAM2 pain points.
+The goal is simple: make advanced segmentation and video analysis features feel native inside OpenShot's UI, while keeping the underlying Comfy graphs stable, predictable, and memory-safe.
+
+## Why this exists
+
+OpenShot needs SAM2 pipelines that can handle real-world clips, not just short demos.
+
+Many SAM2 custom-node workflows process or retain full-video state in ways that become fragile or memory-heavy as clip length grows. In practice, that can lead to slowdowns, failures, or OOM behavior on longer timelines.
+
+This project addresses that gap with chunk-oriented processing designed specifically for OpenShot's planned UI integration path.
+
+## How this works
+
+- Keep node interfaces close to standard ComfyUI types and patterns.
+- Process video segmentation in bounded chunks instead of retaining full-video mask history.
+- Return outputs that are easier for OpenShot to consume and orchestrate in larger editing workflows.
+- Include practical companion nodes (GroundingDINO + TransNetV2) that support automated, timeline-aware tooling.
 
 ## What this includes (V1)
 
@@ -12,10 +27,6 @@ This V1 intentionally stays close to standard ComfyUI primitives and types while
 - `OpenShotSam2VideoSegmentationChunked` (meta-batch/chunk friendly)
 - `OpenShotGroundingDinoDetect` (text-prompted object detection -> mask + JSON)
 - `OpenShotTransNetSceneDetect` (direct TransNetV2 inference -> IN/OUT JSON ranges)
-
-## Why this exists
-
-Some existing SAM2 video nodes accumulate entire-video masks in memory and can OOM on longer clips. This pack provides chunk-safe behavior while keeping Comfy-native node patterns.
 
 ## Attribution
 
@@ -37,17 +48,31 @@ Please see upstream projects for full original implementations and credits.
 
 Install this node pack into `ComfyUI/custom_nodes/OpenShot-ComfyUI` and restart ComfyUI.
 
-### Install dependencies
+## Quick install (copy/paste)
+
+Install this node's Python dependencies:
 
 ```bash
-/home/jonathan/miniforge3/envs/comfyui/bin/python -m pip install -r /home/jonathan/apps/ComfyUI/custom_nodes/OpenShot-ComfyUI/requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### Important note about SAM2 installs
+Install SAM2 manually (required, not in `requirements.txt`):
+
+```bash
+python -m pip install git+https://github.com/facebookresearch/sam2.git
+```
+
+Optional: verify the SAM2 import works in your Comfy environment:
+
+```bash
+python -c "import sam2; print('sam2 import OK')"
+```
+
+Restart ComfyUI after install.
+
+### Why SAM2 is manual
 
 `requirements.txt` intentionally does **not** install SAM2 from Git. This avoids repeated large temporary downloads and long install times during routine updates.
-
-Ensure your Comfy environment already has a compatible `sam2` installed.
 
 ### GroundingDINO model downloads
 
@@ -65,3 +90,10 @@ Ensure your Comfy environment already has a compatible `sam2` installed.
 
 - `OpenShotSam2VideoSegmentationChunked` returns only the requested chunk range (bounded memory) instead of collecting whole-video masks.
 - For very long videos, pair chunked outputs with batch-safe downstream nodes (VHS meta-batch, staged processing, or on-disk intermediates).
+
+---
+
+Copyright (C) 2026 OpenShot Studios, LLC
+
+Licensed under the GNU General Public License v3.0 (GPLv3).
+See [LICENSE.md](LICENSE.md) for the full license text.
